@@ -7,7 +7,7 @@ argument-hint: >
   必需：agent_name、agent_workspace、level_problems。
   可选：benchmark_path、output_dir、arch、npu_id、resume、timeout_per_task、warmup、repeats。
   level_problems 格式：{1: [1,2], 2: [1,3], 3: None}，None 表示该 level 全选。
-  benchmark_path 支持：1) 默认使用 {agent_workspace}/benchmarks/KernelBench；
+  benchmark_path 支持：1) 默认使用 {agent_workspace}/benchmarks/NPUKernelBench；
   2) 指定名称如 "XXbench" 则使用 {agent_workspace}/benchmarks/XXbench；
   3) 相对路径（基于 agent_workspace）；
   4) 绝对路径。
@@ -18,7 +18,7 @@ argument-hint: >
 # Benchmark Evaluator Skill
 
 <role>
-你是一个自动化评测框架执行器。你的任务是串行执行 KernelBench 评测，调用用户指定的 Agent 生成代码，验证正确性，测试性能，并生成详细报告。
+你是一个自动化评测框架执行器。你的任务是串行执行 NPUKernelBench 评测，调用用户指定的 Agent 生成代码，验证正确性，测试性能，并生成详细报告。
 </role>
 
 ## 输入参数
@@ -72,10 +72,10 @@ argument-hint: >
    - 结果：`{agent_workspace}/custom/benchmarks/A`
 
 3. **Benchmark 名称**：不包含 `/`，视为 `agent_workspace/benchmarks/{名称}`
-   - 示例：`KernelBench`
-   - 结果：`{agent_workspace}/benchmarks/KernelBench`
+   - 示例：`NPUKernelBench`
+   - 结果：`{agent_workspace}/benchmarks/NPUKernelBench`
 
-4. **未指定**：默认使用 `{agent_workspace}/benchmarks/KernelBench`
+4. **未指定**：默认使用 `{agent_workspace}/benchmarks/NPUKernelBench`
 
 **路径解析伪代码：**
 
@@ -88,10 +88,10 @@ def resolve_benchmark_path(agent_workspace, benchmark_path=None):
     1. 绝对路径（以/开头）：直接使用
     2. 相对路径（包含/）：基于 agent_workspace 拼接
     3. 名称（不含/）：视为 agent_workspace/benchmarks/{名称}
-    4. 未指定：默认使用 agent_workspace/benchmarks/KernelBench
+    4. 未指定：默认使用 agent_workspace/benchmarks/NPUKernelBench
     """
     if benchmark_path is None:
-        return f"{agent_workspace}/benchmarks/KernelBench"
+        return f"{agent_workspace}/benchmarks/NPUKernelBench"
     
     if benchmark_path.startswith('/'):
         # 绝对路径
@@ -130,9 +130,7 @@ Phase 2: 任务扫描
 
 Phase 3: 串行评测
   └── 串行执行每个任务：
-      ├── 调用用户指定的 Agent 生成代码
-      ├── 正确性验证（使用 agent 指定的 kernel-verifier skill）
-      ├── 性能测试（调用 benchmark.py）
+      ├── 调用用户指定的 Agent 生成代码、验证正确性、测试性能（显示详细步骤）
       ├── 保存结果
       └── 增量更新 agent_report.md（追加本次任务结果）
 
@@ -187,17 +185,21 @@ export ASCEND_RT_VISIBLE_DEVICES={npu_id}
 ## Agent Skills 解析
 
 从 agent 文件的 frontmatter 中解析 skills：
-
+解析skills时必须包含 `ascendc_evalution` skill。
 ```markdown
 ---
 name: my-agent
 skills:
-  - kernel-verifier    # 用于验证
-  - code-generator     # 用于代码生成
+  - op_desc_generation
+  - reference_generation
+  - functional_conversion
+  - ascend_call_generation
+  - dsl_baseline_generation
+  - dsl_lowering
+  - ascendc_evalution # 用于验证正确性
 ---
 ```
-
-验证时将使用 `kernel-verifier` skill 中的 `scripts/verify.py` 和 `scripts/benchmark.py`。
+验证时将使用 `ascendc_evalution` skill 验证正确性，必须验证成功，不允许跳过。
 
 ## 输出目录结构
 
@@ -322,8 +324,8 @@ def update_report_incrementally(task_result, report_path):
 - agent_name: my-agent
 - agent_workspace: /path/to/.opencode
 - level_problems: {1: [1,2,3]}
-- benchmark_path: data/custom_benchmarks/KernelBench
-# 解析为：/path/to/.opencode/data/custom_benchmarks/KernelBench
+- benchmark_path: data/custom_benchmarks/NPUKernelBench
+# 解析为：/path/to/.opencode/data/custom_benchmarks/NPUKernelBench
 ```
 
 ### 示例 7: 指定绝对路径
@@ -334,53 +336,64 @@ def update_report_incrementally(task_result, report_path):
 - agent_name: my-agent
 - agent_workspace: /path/to/.opencode
 - level_problems: {1: [1,2,3]}
-- benchmark_path: /data/shared/benchmarks/KernelBench
-# 直接使用：/data/shared/benchmarks/KernelBench
+- benchmark_path: /data/shared/benchmarks/NPUKernelBench
+# 直接使用：/data/shared/benchmarks/NPUKernelBench
 ```
 
 ## Agent 要求
 
-**实现方式**：此 skill **直接调用 kernelgen-workflow subagent**，无需通过 AKG-triton primary agent。
+**实现方式**：此 skill 调用 my-agent 流程，也可以调用 my-agent 的subagent。执行期间默认同意所有权限，有多个强制确认点（默认确认yes）
 
-### 为什么直接调用 kernelgen-workflow？
 
-1. **非阻塞执行**：AKG-triton 是交互式 agent，有多个强制确认点（question 工具），无法自动化执行
-2. **效率更高**：跳过 AKG-triton 的编排层，直接执行代码生成和验证
-3. **结果一致**：kernelgen-workflow 内部已经包含完整的生成-验证-测试流程
 
 ### Agent 配置
 
-需要指定 agent_workspace（包含 kernelgen-workflow 的工作目录）：
-
+需要指定 my-agent（如果有subagent，也要保护 subagent 的工作目录）：
+1.如果 my-agent 是 `lingxi-code`
 ```markdown
 ---
-name: kernelgen-workflow
-mode: subagent
+name: lingxi-code
+mode: primary
+temperature: 0.1
 skills:
-  - code-generator
-  - kernel-verifier
+  - op_desc_generation
+  - reference_generation
+  - functional_conversion
+  - ascend_call_generation
+  - dsl_baseline_generation
+  - dsl_lowering
+  - ascendc_evalution
 ---
 ```
+
 
 ### 调用方式
 
 benchmark-evaluator 会直接调用：
+
 ```bash
-opencode run --agent kernelgen-workflow "生成并验证算子代码..."
+opencode run --agent lingxi-code "生成并验证算子代码..."
 ```
 
 ### 工作流程
-
+如果是`lingxi-code`，工作流程如下
 ```
 benchmark-evaluator
     ↓
-直接调用 kernelgen-workflow subagent
+直接调用 `lingxi-code` 
     ↓
 内部执行：
-    ├── 代码生成（code-generator skill）
-    ├── 正确性验证（kernel-verifier skill）
-    ├── 性能测试（benchmark.py）
-    └── 输出结果
+    | Stage | Skill | Output |
+    |-------|-------|--------|
+    | 1 | `op_desc_generation` | Operator JSON descriptor |
+    | 2 | `reference_generation` | Reference PyTorch implementation |
+    | 3 | `functional_conversion` | Functional PyTorch API |
+    | 4 | `ascend_call_generation` | Ascend function bindings |
+    | 5 | `dsl_baseline_generation` | Baseline DSL code |
+    | 6 | `dsl_lowering` | Lowered AscendC Code & Compilation artifacts |
+    | 7 | `ascendc_evalution` | Deployment & Evalution result |
+    | 8 | - | Final summary & status report |
+    | 9 | - | Final benchmark summary & status report |
     ↓
 benchmark-evaluator 收集结果并生成报告
 ```
@@ -389,7 +402,7 @@ benchmark-evaluator 收集结果并生成报告
 
 - Python 3.8+
 - opencode Agent 调用机制
-- KernelBench 数据集
+- NPUKernelBench 数据集
 - NPU 设备（用于验证和性能测试）
 
 ## 注意事项
@@ -398,7 +411,7 @@ benchmark-evaluator 收集结果并生成报告
 2. **始终生成报告**: 无论评测成功与否，都会生成 `agent_report.md`
 3. **增量报告**: 每个任务完成后立即更新报告，支持实时查看进度
 4. **断点续跑**: 基于 `(level, problem_id)` 去重，支持中断后恢复
-5. **Agent Skills**: 必须包含 `kernel-verifier` skill 用于验证
+5. **Agent Skills**: 必须包含 `ascendc_evalution` skill 用于验证。
 6. **超时处理**: 单任务超时不影响整体流程，记录为失败
 7. **错误隔离**: 单任务失败会记录但继续执行其他任务
 8. **架构选择**: 首次运行需选择目标硬件架构，选择后保存到状态文件

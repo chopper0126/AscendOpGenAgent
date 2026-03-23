@@ -41,3 +41,20 @@ Console output:
     - pass: result of performance
     - fail: correctness fail message
 
+### evaluate performance
+Perform the operation only after the correctness is successful. You need to run `benchmark.py` to evaluate the performance. It sets environment variables `ASCEND_CUSTOM_OPP_PATH`, adds `.so` file path in `LD_LIBRARY_PATH`, and evaluates the performance.
+
+Usage:
+```shell
+python3 .opencode/skills/ascendc_evalution/scripts/performance.py  \
+    --op_name <op_name> \
+    --verify_dir <input path> \
+    --warmup <number of warmup> \
+    --repeats <number of repeats> \
+    --output <ouput path>
+```
+
+Console output:
+- result of performance
+    - pass: result of performance
+    - fail: correctness fail message
