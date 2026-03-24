@@ -130,7 +130,7 @@ Phase 2: 任务扫描
 
 Phase 3: 串行评测
   └── 串行执行每个任务：
-      ├── 调用用户指定的 Agent 生成代码、验证正确性、测试性能（显示详细步骤）
+      ├── 调用用户指定的 Agent 生成代码、验证正确性、测试性能（显示详细步骤，由于生成时间较长，期间不能跳过生成算子往下走）
       ├── 保存结果
       └── 增量更新 agent_report.md（追加本次任务结果）
 
@@ -369,14 +369,15 @@ skills:
 
 ### 调用方式
 
-benchmark-evaluator 会直接调用：
+benchmark-evaluator 调用步骤：
 
-```bash
-opencode run --agent lingxi-code "生成并验证算子代码..."
+1.切换到Lingxi-Code Agent
+### 示例 8: 输入要生成的算子
+
 ```
-
+生成一个softmax算子的代码并验证正确性
+```
 ### 工作流程
-如果是`lingxi-code`，工作流程如下
 ```
 benchmark-evaluator
     ↓
