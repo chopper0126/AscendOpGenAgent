@@ -23,3 +23,14 @@ class Model(nn.Module):
         """
         a, b = torch.chunk(x, 2, dim=dim)
         return torch.nn.functional.silu(a) * b
+
+def get_inputs():
+    """返回 forward() 的输入参数列表"""
+    batch_size = 32
+    seq_len = 1024
+    return [torch.randn(batch_size, seq_len)]
+
+
+def get_init_inputs():
+    """返回 __init__() 的初始化参数列表"""
+    return []
