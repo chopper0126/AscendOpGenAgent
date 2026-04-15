@@ -12,8 +12,6 @@ tools:
 
 skills:
   - case-simplifier
-  - tilelang-designer
-  - ascendc-translator
   - performance-analyzer
   - trace-recorder
 
@@ -43,19 +41,27 @@ argument-hint: >
 Phase 0: 参数确认           (解析 npu, op_file, output_dir)
 Phase 1: 环境准备           (复制算子文件到输出目录)
 Phase 2: INPUT_CASES 精简   (case-simplifier)
-Phase 3: TileLang 设计表达     (tilelang-designer + 退化检测)
-Phase 4: AscendC 转译与验证  (ascendc-translator + 退化检测)
+Phase 3: TileLang 设计表达     (tilelang-designer-subagent，上下文隔离)
+Phase 4: AscendC 转译与验证  (ascendc-translator-subagent，上下文隔离)
 Phase 5: 性能分析           (performance-analyzer)
 Phase 6: 全量用例验证
 Phase 7: Trace 记录         (trace-recorder)
 ```
 
+### Subagent 调用说明
+
+Phase 3 和 Phase 4 通过 general-purpose subagent 调用，实现上下文隔离：
+- **Phase 3** 调用 `tilelang-designer-subagent`（定义见 `agents/tilelang-designer-subagent.md`），该 subagent 独立拥有 `tilelang-designer` skill，内部完成完整的迭代循环（设计/生成 → 退化检测 → 功能验证 → Conductor 分析）
+- **Phase 4** 调用 `ascendc-translator-subagent`（定义见 `agents/ascendc-translator-subagent.md`），该 subagent 独立拥有 `ascendc-translator` skill，内部完成完整的迭代循环（转译/生成 → 退化检测 → 功能验证 → Conductor 分析）
+- 每个 subagent 完成后，按其输出协议返回结构化结果（成功/失败状态、迭代历史、产出文件）
+- 主 Agent 仅根据 subagent 返回的状态决定后续流程走向，不参与 subagent 内部的迭代推理
+
 ### 退化检测脚本
 
 | 阶段 | 脚本路径 | 说明 |
 |------|---------|------|
-| Phase 3 | `skills/ascendc/tilelang-designer/scripts/validate_tilelang_impl.py` | TileLang 实现退化检测 |
-| Phase 4 | `skills/ascendc/ascendc-translator/scripts/validate_ascendc_impl.py` | AscendC 实现退化检测 |
+| Phase 3 | `skills/ascendc/tilelang-designer/scripts/validate_tilelang_impl.py` | TileLang 实现退化检测（由 subagent 内部调用） |
+| Phase 4 | `skills/ascendc/ascendc-translator/scripts/validate_ascendc_impl.py` | AscendC 实现退化检测（由 subagent 内部调用） |
 ---
 
 ## 关键限制
@@ -140,286 +146,92 @@ Phase 7: Trace 记录         (trace-recorder)
 
 ---
 
-## Phase 3: TileLang 设计表达（迭代循环）
+## Phase 3: TileLang 设计表达（Subagent 调用）
 
-Agent 自身维护迭代状态，编排 "设计/生成 → 退化检测 → 功能验证 → Conductor 分析" 的循环。
+通过 general-purpose subagent 调用 `tilelang-designer-subagent`，在隔离上下文中完成 TileLang 设计表达的完整迭代循环。
 
-### 状态变量
+### 调用方式
 
-```
-tl_iteration = 0
-max_tl_iterations = 5
-tl_history_attempts = []
-tl_verifier_error = ""
-tl_conductor_suggestion = ""
-```
-
-### 前置：Block / Tile 层级设计（仅首次）
-
-首轮（tl_iteration == 0）执行一次性设计步骤，后续迭代不再重复：
-
-1. **Block 层级设计**：调用 `tilelang-designer` skill，生成 `{output_dir}/design/block_level/`
-2. **Tile 层级设计**：调用 `tilelang-designer` skill，生成 `{output_dir}/design/tile_level/`
-3. **可选自检**：生成 `{output_dir}/model_new_tilelang.py`。如用户明确要求，或为了排查 DSL 语法 / 编译问题，可调用 `tilelang-designer` skill 自带的验证脚本做辅助检查；但 TileLang 结果不作为 correctness gate。若遇到 TileLang 框架 bug、尾块语义异常或其他执行问题，应保留设计表达并记录原因，不要为了通过 TileLang 验证而扭曲设计
-
-### 迭代循环
+启动 subagent，传入以下参数：
 
 ```
-while tl_iteration < max_tl_iterations:
+你是 tilelang-designer-subagent。请完成以下任务：
 
-    ── 3.1 代码生成 ──────────────────────────────────
-    调用 tilelang-designer skill 生成 model_new_tilelang.py
+**output_dir**: {output_dir}
+**npu**: {npu}
 
-    首次 (tl_iteration == 0):
-      传入: output_dir
-      基于 design/tile_level/ 中的 TileLang kernel 生成 wrapper
-
-    重试 (tl_iteration > 0):
-      传入: output_dir + tl_verifier_error + tl_conductor_suggestion
-      根据修复建议修改 design/tile_level/ 和/或 model_new_tilelang.py
-
-    产物 → {output_dir}/model_new_tilelang.py
-           {output_dir}/design/tile_level/
-
-    ── 3.2 AST 退化预检查 ────────────────────────────
-    执行 validate_tilelang_impl.py 检测 PyTorch 退化
-
-    python skills/ascendc/tilelang-designer/scripts/validate_tilelang_impl.py \
-        {output_dir}/model_new_tilelang.py
-
-    退化 (exit code != 0):
-      tl_verifier_error = "A-TileLangFallback-Type{N}: {suggestion}"
-      → 跳到 3.4 Conductor
-
-    通过 (exit code == 0):
-      → 继续 3.3
-
-    ── 3.3 功能验证 ──────────────────────────────────
-    调用 tilelang-designer skill 自带的 evaluate_tilelang.sh
-
-    bash skills/ascendc/tilelang-designer/references/evaluate_tilelang.sh \
-        {output_dir}
-
-    验证通过:
-      → break，Phase 3 成功，进入 Phase 4
-
-    验证失败:
-      不做处理
-
-    ── 3.4 Conductor 分析与决策 ──────────────────────
-    (Agent 自身推理，非 Skill 调用)
-
-    错误分类:
-      A 类 — 代码逻辑/算法错误 (可修复)
-        含 A-TileLangFallback-Type{1-4} 子类型
-      B 类 — 环境/基础设施错误 (不可修复)
-      C 类 — 重复失败: 同一 A 类子类型连续 ≥ 3 次
-
-    决策:
-      B 类 → 终止，任务失败
-      C 类 → 终止，任务失败
-      A 类 且 tl_iteration < max_tl_iterations:
-        → 生成 tl_conductor_suggestion
-        → tl_history_attempts.append(本轮记录)
-        → tl_iteration++
-        → continue
-
-达到 max_tl_iterations → Phase 3 失败，跳到 Phase 7 记录 trace
+请按照你的工作流程完成 TileLang 设计表达，完成后按输出协议返回结果。
 ```
 
-### Conductor 修复建议格式
+### Subagent 定义
 
-```
-错误分析：
-- 类型：{A/B/C}（{子类型描述}）
-- 位置：{错误代码位置}
-- 具体错误：{错误详情}
+完整定义见 `agents/tilelang-designer-subagent.md`。Subagent 内部独立完成：
+- Block / Tile 层级设计（仅首次）
+- 代码生成 → AST 退化检测 → 功能验证 → Conductor 分析的迭代循环（最多 5 次）
+- 迭代状态维护和错误分类决策
 
-修复建议：
-1. {具体修改方向}
-2. {具体修改方向}
+### 结果处理
 
-历史提醒：
-- 第 N 轮曾因 {问题} 失败，避免重复
-```
+根据 subagent 返回的结构化结果决定后续流程：
 
-### TileLang 退化子类型
+| Subagent 返回状态 | 主 Agent 处理 |
+|-------------------|--------------|
+| 成功 | Phase 3 完成，进入 Phase 4 |
+| 失败（B 类环境错误） | 任务失败，跳到 Phase 7 记录 trace |
+| 失败（C 类重复失败） | 任务失败，跳到 Phase 7 记录 trace |
+| 失败（达到最大迭代） | Phase 3 失败，跳到 Phase 7 记录 trace |
 
-| 子类型 | 含义 | 修复建议 |
-|--------|------|---------|
-| Type1 | 无 TileLang kernel 导入（纯 PyTorch） | 必须从 design.tile_level.* 导入 kernel builder，在 forward() 中构建并调用 kernel |
-| Type2 | 有 kernel builder 导入但 forward() 未调用 | 在 forward() 中通过 kernel = builder(M, N, ...); kernel(x, y) 模式调用 |
-| Type3 | forward() 调用了 kernel 但部分计算仍用 PyTorch | 将禁止的 PyTorch 计算（torch.*/F.*/tensor 计算方法）移入 TileLang kernel |
-| Type4 | forward() 中存在逐元素 Python for 循环 | 消除 for 循环，使用 TileLang kernel 的向量化/块级操作 |
-
-### A 类错误详细分类（TileLang）
-
-| 特征 | 示例 |
-|------|------|
-| 输出不一致 | 数值精度差异、算法实现与参考不同 |
-| 语法/类型错误 | SyntaxError、TypeError、IndentationError |
-| 形状不匹配 | Tensor shape mismatch、维度错误 |
-| TileLang API 使用错误 | T.copy 参数错误、T.tile.* 不支持的操作 |
-| Kernel 参数错误 | block_size 不合理、core_num 配置错误 |
-| 退化成 PyTorch | 无 kernel builder 导入，直接调用 PyTorch 算子 |
-
-### B 类错误详细分类
-
-| 特征 | 示例 |
-|------|------|
-| 文件路径错误 | FileNotFoundError |
-| 设备不可用 | NPU out of memory、device not found |
-| 依赖缺失 | ModuleNotFoundError（非代码导致） |
-| 编译失败 | TileLang 编译器内部错误 |
-| 超时 | Timeout、进程被杀死 |
-
-**产出**：
+**产出**（由 subagent 生成）：
 - `{output_dir}/design/block_level/` — block-level 设计文件
 - `{output_dir}/design/tile_level/` — TileLang tile-level 设计文件
-- `{output_dir}/model_new_tilelang.py` — TileLang 优化实现（已通过退化检测 + 功能验证）
+- `{output_dir}/model_new_tilelang.py` — TileLang 优化实现
 
 ---
 
-## Phase 4: AscendC 转译与验证（迭代循环）
+## Phase 4: AscendC 转译与验证（Subagent 调用）
 
-Agent 自身维护迭代状态，编排 "转译/生成 → 退化检测 → 功能验证 → Conductor 分析" 的循环。
+通过 general-purpose subagent 调用 `ascendc-translator-subagent`，在隔离上下文中完成 AscendC 转译与验证的完整迭代循环。
 
 ### 前置条件
 
+- Phase 3 subagent 已成功返回
 - `{output_dir}/design/tile_level/` TileLang 代码已存在
 - `{output_dir}/model_new_tilelang.py` 已存在
 
-### 状态变量
+### 调用方式
+
+启动 subagent，传入以下参数：
 
 ```
-ac_iteration = 0
-max_ac_iterations = 3
-ac_history_attempts = []
-ac_verifier_error = ""
-ac_conductor_suggestion = ""
+你是 ascendc-translator-subagent。请完成以下任务：
+
+**output_dir**: {output_dir}
+**npu**: {npu}
+
+请按照你的工作流程完成 AscendC 转译与验证，完成后按输出协议返回结果。
 ```
 
-### 前置：TileLang → AscendC 转译（仅首次）
+### Subagent 定义
 
-首轮（ac_iteration == 0）执行一次性转译步骤，后续迭代不再重复：
+完整定义见 `agents/ascendc-translator-subagent.md`。Subagent 内部独立完成：
+- TileLang → AscendC 转译（仅首次）
+- 代码生成 → AST 退化检测 → 功能验证 → Conductor 分析的迭代循环（最多 3 次）
+- 迭代状态维护和错误分类决策
 
-1. **AscendC 转译**：调用 `ascendc-translator` skill，读取 `@references/TileLang-AscendC-API-Mapping.md`，将 `{output_dir}/design/tile_level/` 中的 TileLang kernel 转译为 AscendC kernel，输出到 `{output_dir}/kernel/`
+### 结果处理
 
-### 迭代循环
+根据 subagent 返回的结构化结果决定后续流程：
 
-```
-while ac_iteration < max_ac_iterations:
+| Subagent 返回状态 | 主 Agent 处理 |
+|-------------------|--------------|
+| 成功 | Phase 4 完成，进入 Phase 5 |
+| 失败（B 类环境错误） | 任务失败，跳到 Phase 7 记录 trace |
+| 失败（C 类重复失败） | 任务失败，跳到 Phase 7 记录 trace |
+| 失败（达到最大迭代） | Phase 4 失败，跳到 Phase 7 记录 trace |
 
-    ── 4.1 代码生成 ──────────────────────────────────
-    调用 ascendc-translator skill 生成 model_new_ascendc.py
-
-    首次 (ac_iteration == 0):
-      传入: output_dir
-      基于 kernel/ 中的 AscendC kernel 生成 wrapper
-
-    重试 (ac_iteration > 0):
-      传入: output_dir + ac_verifier_error + ac_conductor_suggestion
-      根据修复建议修改 kernel/ 和/或 model_new_ascendc.py
-
-    产物 → {output_dir}/model_new_ascendc.py
-           {output_dir}/kernel/
-
-    ── 4.2 AST 退化预检查 ────────────────────────────
-    执行 validate_ascendc_impl.py 检测 PyTorch 退化
-
-    python skills/ascendc/ascendc-translator/scripts/validate_ascendc_impl.py \
-        {output_dir}/model_new_ascendc.py
-
-    退化 (exit code != 0):
-      ac_verifier_error = "A-AscendCFallback-Type{N}: {suggestion}"
-      → 跳到 4.4 Conductor
-
-    通过 (exit code == 0):
-      → 继续 4.3
-
-    ── 4.3 功能验证 ──────────────────────────────────
-    调用 ascendc-translator skill 自带的 evaluate_ascendc.sh
-
-    bash skills/ascendc/ascendc-translator/references/evaluate_ascendc.sh \
-        {output_dir}
-
-    验证通过:
-      → break，Phase 4 成功，进入 Phase 5
-
-    验证失败:
-      ac_verifier_error = evaluate_ascendc.sh 的错误输出
-      → 跳到 4.4 Conductor
-
-    ── 4.4 Conductor 分析与决策 ──────────────────────
-    (Agent 自身推理，非 Skill 调用)
-
-    错误分类:
-      A 类 — 代码逻辑/算法错误 (可修复)
-        含 A-AscendCFallback-Type{1-4} 子类型
-      B 类 — 环境/基础设施错误 (不可修复)
-      C 类 — 重复失败: 同一 A 类子类型连续 ≥ 3 次
-
-    决策:
-      B 类 → 终止，任务失败
-      C 类 → 终止，任务失败
-      A 类 且 ac_iteration < max_ac_iterations:
-        → 生成 ac_conductor_suggestion
-        → ac_history_attempts.append(本轮记录)
-        → ac_iteration++
-        → continue
-
-达到 max_ac_iterations → Phase 4 失败，跳到 Phase 7 记录 trace
-```
-
-### Conductor 修复建议格式
-
-```
-错误分析：
-- 类型：{A/B/C}（{子类型描述}）
-- 位置：{错误代码位置}
-- 具体错误：{错误详情}
-
-修复建议：
-1. {具体修改方向}
-2. {具体修改方向}
-
-历史提醒：
-- 第 N 轮曾因 {问题} 失败，避免重复
-```
-
-### AscendC 退化子类型
-
-| 子类型 | 含义 | 修复建议 |
-|--------|------|---------|
-| Type1 | 无 AscendC 扩展导入（纯 PyTorch / 占位符如 TORCH_EXTENSION_NAME） | 必须导入编译好的 AscendC kernel 扩展（如 import _xxx_ext），并在 forward() 中调用 |
-| Type2 | 有扩展导入但 forward() 未调用 kernel | 在 forward() 中通过 ext_module.function_name(...) 调用 kernel |
-| Type3 | forward() 调用了 kernel 但部分计算仍用 PyTorch | 将禁止的 PyTorch 计算（torch.*/F.*/tensor 计算方法）移入 AscendC kernel |
-| Type4 | forward() 中存在逐元素 Python for 循环 | 消除 for 循环，使用 AscendC kernel 的向量化/块级操作 |
-
-### A 类错误详细分类（AscendC）
-
-| 特征 | 示例 |
-|------|------|
-| 输出不一致 | 数值精度差异、算法实现与参考不同 |
-| 语法/类型错误 | SyntaxError、TypeError、编译错误 |
-| 形状不匹配 | Tensor shape mismatch、维度错误 |
-| AscendC API 使用错误 | DataCopy 参数错误、Pipe 配置错误 |
-| Kernel 参数错误 | tiling 参数不合理、block_dim 配置错误 |
-| 退化成 PyTorch | 无 kernel 扩展导入，直接调用 PyTorch 算子 |
-
-### B 类错误详细分类
-
-| 特征 | 示例 |
-|------|------|
-| 文件路径错误 | FileNotFoundError |
-| 设备不可用 | NPU out of memory、device not found |
-| 依赖缺失 | ModuleNotFoundError（非代码导致） |
-| 编译失败 | AscendC 编译器内部错误（非代码语法问题） |
-| 超时 | Timeout、进程被杀死 |
-
-**产出**：
+**产出**（由 subagent 生成）：
 - `{output_dir}/kernel/` — AscendC kernel 文件
-- `{output_dir}/model_new_ascendc.py` — AscendC 优化实现（已通过退化检测 + 功能验证）
+- `{output_dir}/model_new_ascendc.py` — AscendC 优化实现
 
 ---
 
@@ -486,8 +298,8 @@ while ac_iteration < max_ac_iterations:
 ```
 
 **Skill 参考资料**（各 skill 独立维护，位于 `skills/<skill-name>/references/`）：
-- `tilelang-designer`：BlockLevelDesign.md、TileLangAscendProgrammingGuide.md、TileLangDebug.md、evaluate_tilelang.sh
-- `ascendc-translator`：dsl2Ascendc.md、TileLang-AscendC-API-Mapping.md、AscendC_knowledge/、AscendCVerification.md、evaluate_ascendc.sh
+- `tilelang-designer`：BlockLevelDesign.md、TileLangAscendProgrammingGuide.md、TileLangDebug.md、evaluate_tilelang.sh（由 tilelang-designer-subagent 使用）
+- `ascendc-translator`：dsl2Ascendc.md、TileLang-AscendC-API-Mapping.md、AscendC_knowledge/、AscendCVerification.md、evaluate_ascendc.sh（由 ascendc-translator-subagent 使用）
 - `performance-analyzer`：performance.py（性能测试脚本）
 - `trace-recorder`：evaluate_tilelang.sh、evaluate_ascendc.sh
 
@@ -500,11 +312,11 @@ while ac_iteration < max_ac_iterations:
 | Phase 0 | op_file 不存在 | 报错，提示用户提供正确的算子描述文件路径 |
 | Phase 0 | output_dir 创建失败 | 报错，检查权限 |
 | Phase 2 | 无需精简 | 跳过，继续后续阶段 |
-| Phase 3 | TileLang 退化检测失败 | 标记 A-TileLangFallback-Type{N}，不执行功能验证，直接修复迭代 |
-| Phase 3 | TileLang 验证失败 | 记录为辅助检查失败；若属 TileLang 自身问题，可跳过并继续 Phase 4 |
-| Phase 4 | AscendC 退化检测失败 | 标记 A-AscendCFallback-Type{N}，不执行功能验证，消耗迭代次数修复 |
-| Phase 4 | AscendC 验证失败 | 最多 3 次迭代，失败后报告状态 |
-| Phase 4 | B 类环境错误 | 立即终止，任务失败 |
+| Phase 3 | Subagent 返回失败 | 根据失败类型（B/C/达到上限）跳到 Phase 7 |
+| Phase 3 | TileLang 验证失败（subagent 内部） | 由 subagent 内部处理迭代；若属 TileLang 自身问题，subagent 可跳过并继续 |
+| Phase 4 | Subagent 返回失败 | 根据失败类型（B/C/达到上限）跳到 Phase 7 |
+| Phase 4 | AscendC 验证失败（subagent 内部） | 由 subagent 内部处理迭代，最多 3 次 |
+| Phase 4 | B 类环境错误（subagent 内部） | Subagent 返回失败，主 Agent 终止任务 |
 | Phase 6 | 全量验证失败 | 记录结果，不修复，继续 Phase 7 |
 | Phase 7 | Trace 记录失败 | 不影响主流程，仅记录失败状态 |
 
@@ -512,11 +324,11 @@ while ac_iteration < max_ac_iterations:
 
 | 分类 | 含义 | 处理 |
 |------|------|------|
-| A 类 — 代码逻辑/算法错误 | 可修复，含退化子类型 | 生成修复建议，继续迭代 |
-| A-TileLangFallback-Type{1-4} | TileLang 实现退化（见 Phase 3 子类型表） | 按退化脚本 suggestion 修复 |
-| A-AscendCFallback-Type{1-4} | AscendC 实现退化（见 Phase 4 子类型表） | 按退化脚本 suggestion 修复 |
-| B 类 — 环境/基础设施错误 | 不可修复 | 立即终止 |
-| C 类 — 重复失败 | 同一 A 类子类型连续 ≥ 3 次 | 立即终止 |
+| A 类 — 代码逻辑/算法错误 | 可修复，含退化子类型 | 由 subagent 内部生成修复建议，继续迭代 |
+| A-TileLangFallback-Type{1-4} | TileLang 实现退化 | 由 tilelang-designer-subagent 内部按退化脚本 suggestion 修复 |
+| A-AscendCFallback-Type{1-4} | AscendC 实现退化 | 由 ascendc-translator-subagent 内部按退化脚本 suggestion 修复 |
+| B 类 — 环境/基础设施错误 | 不可修复 | Subagent 返回失败，主 Agent 立即终止 |
+| C 类 — 重复失败 | 同一 A 类子类型连续 ≥ 3 次 | Subagent 返回失败，主 Agent 立即终止 |
 
 ---
 
@@ -524,13 +336,15 @@ while ac_iteration < max_ac_iterations:
 
 | 约束 | 说明 |
 |------|------|
-| Phase 4 最大迭代 | 3 次，禁止超出 |
+| Phase 3 最大迭代 | 5 次（由 subagent 内部控制），禁止超出 |
+| Phase 4 最大迭代 | 3 次（由 subagent 内部控制），禁止超出 |
 | 禁止 PyTorch 退化 | model_new_*.py 中禁止 torch.* 计算操作 |
-| 退化检测前置 | 每次生成/修改 model_new_tilelang.py 或 model_new_ascendc.py 后，必须先通过退化检测脚本，再执行功能验证 |
-| A 类连续上限 | 同一退化子类型连续 ≥ 3 次 → 自动终止 |
+| 退化检测前置 | 每次生成/修改 model_new_tilelang.py 或 model_new_ascendc.py 后，必须先通过退化检测脚本，再执行功能验证（由 subagent 内部执行） |
+| A 类连续上限 | 同一退化子类型连续 ≥ 3 次 → 自动终止（由 subagent 内部判定） |
 | 文件操作范围 | 限制在 `{output_dir}/` 目录内 |
 | 验证方式 | 各 Phase 使用对应 Skill 自带的 `@references/` 工具 |
 | NPU 设备 | 通过 `ASCEND_RT_VISIBLE_DEVICES` 环境变量设置 |
+| Subagent 上下文隔离 | Phase 3/4 的迭代推理在独立 subagent 上下文中完成，主 Agent 不参与内部迭代 |
 | 语言 | 思考、分析、日志使用中文；代码、路径使用英文 |
 
 ---
