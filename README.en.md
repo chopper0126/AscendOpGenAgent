@@ -102,19 +102,29 @@ Generate a softmax operator implementation based on the Triton-Ascend framework.
 
 Suitable for batch generation and evaluation of multiple operators with support for single NPU serial or multi-NPU parallel execution.
 
+**Two input modes are supported:**
+- **Standard Mode**: Using KernelBench (PyTorch Model)
+- **GPU Migration Mode**: Using TritonNPUKernelBench (GPU Triton Code → NPU Triton Code)
+
+---
+
+##### Sub-mode A: Standard Mode (KernelBench)
+
+Suitable for standard PyTorch operators batch generation and evaluation.
+
 **Steps**:
 
 1. Create the `.claude` directory in the AscendOpGenAgent directory and configure the Agent:
 ```bash
 mkdir -p .claude
 mkdir -p .claude/skills
-mv agents/triton-ascend-coder.md .claude/CLAUDE.md
-mv skills/triton/* .claude/skills/
+cp agents/triton-ascend-coder.md .claude/CLAUDE.md
+cp -r skills/triton/* .claude/skills/
 ```
 
 2. Enter the AscendOpGenAgent directory and execute the batch scheduling script:
 
-**Single NPU Serial Mode** (backward compatible):
+**Single NPU Serial Mode**:
 ```bash
 cd /path/to/AscendOpGenAgent
 bash utils/run_benchmark_triton.sh \
@@ -137,13 +147,67 @@ bash utils/run_benchmark_triton.sh \
 ```
 
 **Parameter Description**:
-- `--benchmark-dir`: Path to KernelBench root directory (required)
+- `--benchmark-dir`: Path to Benchmark root directory (required)
 - `--level`: Level number, e.g., 1, 2, 3, 4 (required)
 - `--range`: Operator range, e.g., `1-30` (mutually exclusive with `--ids`)
 - `--ids`: Comma-separated operator IDs, e.g., `3,7,15` (mutually exclusive with `--range`)
 - `--npu`: Single NPU device ID, e.g., 0 (default 0, mutually exclusive with `--npu-list`)
 - `--npu-list`: Multi-NPU list, comma-separated, e.g., `0,1,2,3,4,5` (mutually exclusive with `--npu`, higher priority)
 - `--output`: Output directory (required)
+
+---
+
+##### Sub-mode B: GPU Triton Code → NPU (TritonNPUKernelBench)
+
+Suitable for migrating existing GPU Triton kernels to NPU Triton implementations with direct performance comparison against GPU baseline.
+
+**Prerequisites**:
+Upload the following files to `benchmarks/TritonNPUKernelBench/` directory (files must share the same base name):
+- `{op_name}.pt` - Contains `input_data` (required) and optional `gpu_output`
+- `vllm_gpu_perf.csv` - GPU performance baseline data (for comparison)
+
+**Steps**:
+
+1. Configure the Agent in the AscendOpGenAgent directory:
+```bash
+mkdir -p .claude
+mkdir -p .claude/skills
+cp agents/triton-ascend-coder.md .claude/CLAUDE.md
+cp -r skills/triton/* .claude/skills/
+```
+
+2. Enter the AscendOpGenAgent directory and start Claude:
+```bash
+claude
+```
+
+3. Enter the operator generation Prompt:
+```text
+Generate triton operator,
+Description file path: benchmarks/TritonNPUKernelBench/${operator}.py,
+arch is ascend910b2, ASCEND_RT_VISIBLE_DEVICES=1
+Output directory is /path/to/output
+```
+
+> **Note**: Although the prompt includes the `.py` file path, the Agent will automatically detect the TritonNPUKernelBench path and enter **GPU Kernel Input Mode**, automatically looking for the same-named `.pt` file and `vllm_gpu_perf.csv` file. The `.py` file is used to understand the operator logic, while actual data is loaded from `.pt`.
+
+**Execution Flow**:
+- **Phase 0**: Auto-detects TritonNPUKernelBench path, enters GPU Kernel Input Mode
+- **Phase 1**: Builds task description from `.pt` file (does not call op-task-extractor skill, built by Agent itself)
+- **Phase 2-5**: Standard workflow to generate NPU Triton code
+- **Performance Comparison**: Auto-comparison of NPU implementation vs GPU baseline performance
+
+**Output Features** (GPU Migration Mode only):
+- `report.md` will additionally display **"GPU Reference Performance"** section:
+  - GPU reference latency (from `vllm_gpu_perf.csv`)
+  - Ascend Triton latency
+  - Ascend/GPU ratio
+- `summary.json` will contain extended fields:
+  - `gpu_mode: true`
+  - `perf_data.gpu_reference_ms`
+  - `perf_data.ascend_vs_gpu_ratio`
+  - `per_shape_results[].gpu_reference_ms`
+  - `per_shape_results[].ascend_vs_gpu_ratio`
 
 
 #### **3.2 AscendC**
@@ -253,8 +317,12 @@ AscendOpGenAgent/
 │   │   ├── level2/             # Level 2 test cases (99 tasks)
 │   │   ├── level3/             # Level 3 test cases (52 tasks)
 │   │   └── level4/             # Level 4 test cases (20 tasks)
-│   └── NPUKernelBench/
-│       └── level1/             # NPU KernelBench Level 1 test cases (31 tasks)
+│   ├── NPUKernelBench/
+│   │   └── level1/             # NPU KernelBench Level 1 test cases (31 tasks)
+│   └── TritonNPUKernelBench/   # GPU Triton → NPU migration dataset
+│       ├── {op_name}.pt        # Contains input_data and optional gpu_output
+│       ├── {op_name}.py        # GPU Triton kernel source code
+│       └── vllm_gpu_perf.csv   # GPU performance baseline data
 └── skills/                     # Skill implementation directory
     ├── ascendc_evalution/
     ├── ascend_benchmark_evaluator/
@@ -390,7 +458,7 @@ def get_init_inputs():
     "avg_latency_ms": 0.1567,
     "peak_memory_mb": 1.25
   },
-  "speedup_vs_torch": 1.50,
+  "speedup_vs_torch": 1.5000,
   "perf_method": "profiler",
   "skill_path": "/path/to/.claude/skills/kernel-verifier"
 }
@@ -412,7 +480,7 @@ def get_init_inputs():
     "avg_latency_ms": 0.3123,
     "peak_memory_mb": 4.25
   },
-  "speedup_vs_torch": 1.46,
+  "speedup_vs_torch": 1.4600,
   "perf_method": "profiler",
   "skill_path": "/path/to/.claude/skills/kernel-verifier",
   "per_shape_results": [
@@ -426,7 +494,7 @@ def get_init_inputs():
         "avg_latency_ms": 0.0156,
         "peak_memory_mb": 0.25
       },
-      "speedup_vs_torch": 1.50
+      "speedup_vs_torch": 1.5000
     },
     {
       "shape": [256, 256],
@@ -438,7 +506,7 @@ def get_init_inputs():
         "avg_latency_ms": 0.0588,
         "peak_memory_mb": 1.00
       },
-      "speedup_vs_torch": 1.52
+      "speedup_vs_torch": 1.5200
     },
     {
       "shape": [1024, 1024],
@@ -450,7 +518,7 @@ def get_init_inputs():
         "avg_latency_ms": 0.8625,
         "peak_memory_mb": 12.50
       },
-      "speedup_vs_torch": 1.46
+      "speedup_vs_torch": 1.4600
     }
   ]
 }

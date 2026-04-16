@@ -32,6 +32,8 @@ class BenchmarkConfig:
     triton_impl_name: str = TRITON_IMPL_NAME_DEFAULT
     warmup: int = WARMUP_DEFAULT
     repeats: int = REPEATS_DEFAULT
+    skip_framework: bool = False
+    framework_latency_ms: float = 0.0
 
 
 @dataclass
@@ -394,7 +396,7 @@ def run_single_benchmark(
     case_idx: int,
     total_cases: int
 ) -> SingleShapeResult:
-    """对单组输入进行性能测试。
+    """对单组输入进行性能测试（支持跳过 framework 测试）。
 
     注意: 此函数依赖 torch 和 torch_npu，应在已导入这些模块的上下文中调用。
 
@@ -413,25 +415,29 @@ def run_single_benchmark(
 
     print(f"  测试第 {case_idx}/{total_cases} 组输入...")
 
-    # 将输入移至设备
-    inputs_framework = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
     inputs_impl = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
-    
-    # 测试框架实现
-    print(f"测试 Framework (warmup={config.warmup}, active={config.repeats})...")
-    framework_operators, framework_latency_ms, framework_peak_memory = measure_single(
-        framework_model, inputs_framework, config.warmup, config.repeats, 
-        f"framework_profile_case{case_idx}", device
-    )
+
+    if config.skip_framework:
+        print(f"    跳过 Framework 测试，使用参考延迟: {config.framework_latency_ms:.4f} ms")
+        framework_operators: Dict[str, float] = {}
+        framework_latency_ms = config.framework_latency_ms
+        framework_peak_memory = 0.0
+    else:
+        inputs_framework = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
+        print(f"    测试 Framework (warmup={config.warmup}, active={config.repeats})...")
+        framework_operators, framework_latency_ms, framework_peak_memory = measure_single(
+            framework_model, inputs_framework, config.warmup, config.repeats, 
+            f"framework_profile_case{case_idx}", device
+        )
     
     # 测试生成实现
-    print(f"测试 Implementation (warmup={config.warmup}, active={config.repeats})...")
+    print(f"    测试 Implementation (warmup={config.warmup}, active={config.repeats})...")
     impl_operators, impl_latency_ms, impl_peak_memory = measure_single(
         impl_model, inputs_impl, config.warmup, config.repeats, 
         f"impl_profile_case{case_idx}", device
     )
     
-    if framework_latency_ms is None or impl_latency_ms is None:
+    if (not config.skip_framework and framework_latency_ms is None) or impl_latency_ms is None:
         raise RuntimeError(
             f"[用例 {case_idx}/{total_cases}] 无法从 profiler 提取有效时延数据"
         )
@@ -454,7 +460,7 @@ def run_single_benchmark(
             peak_memory_mb=round(impl_peak_memory, 2),
             operators=impl_operators or {}
         ),
-        speedup_vs_torch=round(speedup, 2)
+        speedup_vs_torch=round(speedup, 4)
     )
 
 
@@ -503,7 +509,7 @@ def compute_overall_average(results: List[SingleShapeResult]) -> Tuple[Performan
             peak_memory_mb=round(statistics.mean(impl_memories), 2),
             operators={k: round(v / n, 4) for k, v in impl_ops.items()}
         ),
-        round(statistics.mean(speedups), 2)
+        round(statistics.mean(speedups), 4)
     )
 
 
@@ -621,6 +627,10 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP_DEFAULT, help="warmup 次数（默认 5）")
     parser.add_argument("--repeats", type=int, default=REPEATS_DEFAULT, help="正式测试次数（默认 50）")
     parser.add_argument("--output", help="输出文件路径（JSON 格式）")
+    parser.add_argument("--skip_framework", action="store_true",
+                       help="跳过 framework 性能测试（GPU Kernel 模式使用）")
+    parser.add_argument("--framework_latency_ms", type=float, default=0.0,
+                       help="预设的 framework 参考延迟（毫秒），用于计算 speedup")
     args = parser.parse_args()
     
     # 验证目录
@@ -635,7 +645,9 @@ def main():
         verify_dir=verify_dir,
         triton_impl_name=args.triton_impl_name,
         warmup=args.warmup,
-        repeats=args.repeats
+        repeats=args.repeats,
+        skip_framework=args.skip_framework,
+        framework_latency_ms=args.framework_latency_ms,
     )
     
     try:
@@ -647,7 +659,7 @@ def main():
         print("\n性能测试结果:")
         print(f"  框架实现 - 平均延迟: {result_dict['framework']['avg_latency_ms']:.4f} ms")
         print(f"  生成实现 - 平均延迟: {result_dict['implementation']['avg_latency_ms']:.4f} ms")
-        print(f"  加速比: {result_dict['speedup_vs_torch']:.2f}x")
+        print(f"  加速比: {result_dict['speedup_vs_torch']:.4f}x")
         print(f"  生成实现 - 峰值内存: {result_dict['implementation']['peak_memory_mb']:.2f} MB")
         
         # 保存到文件或输出

@@ -102,6 +102,16 @@ claude
 
 适用于批量评测算子的生成效果，支持单 NPU 串行或多 NPU 并行执行。
 
+**支持两种输入模式：**
+- **标准模式**：使用 KernelBench（PyTorch Model）
+- **GPU 迁移模式**：使用 TritonNPUKernelBench（GPU Triton Code → NPU Triton Code）
+
+---
+
+##### 子模式 A：标准模式（KernelBench）
+
+适用于标准 PyTorch 算子的批量生成与评测。
+
 **操作步骤**：
 
 1. 在 AscendOpGenAgent 目录下创建 `.claude` 目录并配置 Agent：
@@ -144,6 +154,60 @@ bash utils/run_benchmark_triton.sh \
 - `--npu`: 单 NPU 设备 ID，如 0（默认 0，与 `--npu-list` 互斥）
 - `--npu-list`: 多 NPU 列表，逗号分隔，如 `0,1,2,3,4,5`（与 `--npu` 互斥，优先级更高）
 - `--output`: 输出目录（必填）
+
+---
+
+##### 子模式 B：GPU Triton Code → NPU（TritonNPUKernelBench）
+
+适用于将已有的 GPU Triton kernel 迁移为 NPU Triton 实现，并与 GPU 性能进行直接对比。
+
+**前置准备**：
+将以下文件上传到 `benchmarks/TritonNPUKernelBench/` 目录（文件名必须同名）：
+- `{op_name}.pt` - 包含 `input_data`（必需）和可选的 `gpu_output`
+- `vllm_gpu_perf.csv` - GPU 性能基线数据（用于对比加速比）
+
+**操作步骤**：
+
+1. 在 AscendOpGenAgent 目录下配置 Agent：
+```bash
+mkdir -p .claude
+mkdir -p .claude/skills
+mv agents/triton-ascend-coder.md .claude/CLAUDE.md
+mv skills/triton/* .claude/skills/
+```
+
+2. 进入 AscendOpGenAgent 目录，启动 claude：
+```bash
+claude
+```
+
+3. 输入算子生成 Prompt：
+```text
+生成triton算子，
+描述文件路径：benchmarks/TritonNPUKernelBench/${算子}.py，
+arch是 ascend910b2，ASCEND_RT_VISIBLE_DEVICES=1
+输出目录是 /path/to/output
+```
+
+> **说明**：虽然 prompt 中包含 `.py` 文件路径，Agent 会自动检测到 TritonNPUKernelBench 路径并进入 **GPU Kernel 输入模式**，自动查找同名的 `.pt` 文件和 `vllm_gpu_perf.csv` 文件。`.py` 文件用于了解算子逻辑，实际数据从 `.pt` 加载。
+
+**执行流程**：
+- **Phase 0**: 自动检测 TritonNPUKernelBench 路径，进入 GPU Kernel 输入模式
+- **Phase 1**: 从 `.pt` 文件构建任务描述（不调用 op-task-extractor skill，由 Agent 自建）
+- **Phase 2-5**: 标准流程生成 NPU Triton 代码
+- **性能对比**: 自动对比 NPU 实现与 GPU 基线性能
+
+**输出特性**（仅在 GPU 迁移模式下）：
+- `report.md` 将额外显示 **"GPU 参考性能"** 部分：
+  - GPU 参考延迟（来自 `vllm_gpu_perf.csv`）
+  - Ascend Triton 延迟
+  - Ascend/GPU 倍数
+- `summary.json` 将包含扩展字段：
+  - `gpu_mode: true`
+  - `perf_data.gpu_reference_ms`
+  - `perf_data.ascend_vs_gpu_ratio`
+  - `per_shape_results[].gpu_reference_ms`
+  - `per_shape_results[].ascend_vs_gpu_ratio`
 
 
 #### **3.2 AscendC**
@@ -253,8 +317,12 @@ AscendOpGenAgent/
 │   │   ├── level2/             # Level 2 测试用例 (99个)
 │   │   ├── level3/             # Level 3 测试用例 (52个)
 │   │   └── level4/             # Level 4 测试用例 (20个)
-│   └── NPUKernelBench/
-│       └── level1/             # NPU KernelBench Level 1 测试用例 (31个)
+│   ├── NPUKernelBench/
+│   │   └── level1/             # NPU KernelBench Level 1 测试用例 (31个)
+│   └── TritonNPUKernelBench/   # GPU Triton → NPU 迁移评测数据集
+│       ├── {op_name}.pt        # 包含 input_data 和可选 gpu_output
+│       ├── {op_name}.py        # GPU Triton kernel 源码
+│       └── vllm_gpu_perf.csv   # GPU 性能基线数据
 └── skills/                     # Skill 实现目录
     ├── ascendc_evalution/
     ├── ascend_benchmark_evaluator/
@@ -391,7 +459,7 @@ def get_init_inputs():
     "avg_latency_ms": 0.1567,
     "peak_memory_mb": 1.25
   },
-  "speedup_vs_torch": 1.50,
+  "speedup_vs_torch": 1.5000,
   "perf_method": "profiler",
   "skill_path": "/path/to/.claude/skills/kernel-verifier"
 }
@@ -413,7 +481,7 @@ def get_init_inputs():
     "avg_latency_ms": 0.3123,
     "peak_memory_mb": 4.25
   },
-  "speedup_vs_torch": 1.46,
+  "speedup_vs_torch": 1.4600,
   "perf_method": "profiler",
   "skill_path": "/path/to/.claude/skills/kernel-verifier",
   "per_shape_results": [
@@ -427,7 +495,7 @@ def get_init_inputs():
         "avg_latency_ms": 0.0156,
         "peak_memory_mb": 0.25
       },
-      "speedup_vs_torch": 1.50
+      "speedup_vs_torch": 1.5000
     },
     {
       "shape": [256, 256],
@@ -439,7 +507,7 @@ def get_init_inputs():
         "avg_latency_ms": 0.0588,
         "peak_memory_mb": 1.00
       },
-      "speedup_vs_torch": 1.52
+      "speedup_vs_torch": 1.5200
     },
     {
       "shape": [1024, 1024],
@@ -451,7 +519,7 @@ def get_init_inputs():
         "avg_latency_ms": 0.8625,
         "peak_memory_mb": 12.50
       },
-      "speedup_vs_torch": 1.46
+      "speedup_vs_torch": 1.4600
     }
   ]
 }

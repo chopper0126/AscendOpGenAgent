@@ -34,7 +34,7 @@ skills:
 
 ```
 Phase 0: 参数确认
-Phase 1: 任务构建          (op-task-extractor)
+Phase 1: 任务构建          (op-task-extractor / GPU Kernel 模式由 Agent 自建)
 Phase 2: 算法设计          (kernel-designer)
 Phase 3: 代码生成与验证    (kernel-generator + kernel-verifier, 迭代)
 Phase 4: 性能优化与验证    (latency-optimizer + kernel-verifier, 迭代)
@@ -47,7 +47,25 @@ Phase 5: 输出报告
 
 从用户输入中提取硬件架构 `arch`。若用户未明确指定，通过 `npu-smi info` 自动检测。若检测失败，使用默认值 `ascend910b1`。
 
-创建工作目录：
+### GPU Kernel 模式自动检测
+
+当用户提供的算子描述文件满足以下任一条件时，进入 **GPU Kernel 输入模式**：
+1. 文件路径包含 `TritonNPUKernelBench`
+2. 文件内容包含 `@triton.jit`（即这是一个 GPU Triton kernel，而非 PyTorch Model）
+3. 用户显式提供了 `gpu_perf_csv` 或 `pt_file` 路径
+
+**路径推导规则**（必须通过 bash 工具探测确认）：
+- `op_name` = 描述文件名去掉 `.py` 后缀
+- `pt_file` 推导：
+  - 若用户显式提供，直接使用
+  - 否则，自动查找描述文件同级目录下的 `{op_name}.pt`
+  - 找不到 → 报错终止
+- `gpu_perf_csv` 推导：
+  - 若用户显式提供，直接使用
+  - 否则，从描述文件所在目录开始**向上级目录递归查找** `vllm_gpu_perf.csv`（最多向上 3 级）
+  - 找不到 → 告警并在报告中注明"未找到 GPU 性能基线"
+
+### 工作目录创建
 
 ```
 ${pwd}/triton_ascend_output/op_{op_index}_{op_name}_{YYYYMMDD_HHMM}_{4位随机数}/
@@ -62,7 +80,9 @@ python3 -c "import datetime,random; ts=datetime.datetime.now().strftime('%Y%m%d_
 
 ## Phase 1: 任务构建
 
-调用 `op-task-extractor` skill，从用户描述中构建 KernelBench 格式的任务描述文件。
+### 模式 A：标准 KernelBench
+
+当描述文件为 PyTorch `nn.Module` 实现时，调用 `op-task-extractor` skill，从用户描述中构建 KernelBench 格式的任务描述文件。
 
 **产出**：`{工作目录}/{op_name}.py`（仅包含 Model 类 + 输入函数 + `get_init_inputs()`，不含测试驱动）。
 
@@ -75,6 +95,31 @@ python3 -c "import datetime,random; ts=datetime.datetime.now().strftime('%Y%m%d_
 - 任务文件应提供 `get_input_groups()` 函数，返回 `List[List[Tensor/...]]`
 - 每组输入对应一个 shape 配置，例如：`[[tensor1_shapeA, tensor2_shapeA], [tensor1_shapeB, tensor2_shapeB], ...]`
 - 验证和性能测试将遍历所有 shape 组，输出每个 shape 的性能数据
+
+### 模式 B：GPU Kernel 输入模式（TritonNPUKernelBench）
+
+**不调用 `op-task-extractor` skill**，由 Agent 自身执行以下步骤：
+
+1. **读取数据源**
+   - `desc_file`：GPU kernel 源码（用户提供的 `.py`）
+   - `pt_file`：`torch.load()` 后的 dict，包含 `input_data`（必须）和可选的 `gpu_output`
+
+2. **构建 `Model` 类**
+   - **首选方案**：若 `.pt` 中存在 `gpu_output`，构造一个 `Model` 其 `forward()` 直接返回预存的 `gpu_output`
+     - 此时 framework 延迟将直接替换为 GPU 参考延迟，不再额外标注说明
+   - **兜底方案**：若 `.pt` 中不存在 `gpu_output`，则根据 `@triton.jit` kernel 的语义，手写一个等价的纯 PyTorch 参考实现
+     - 若 kernel 逻辑过于复杂无法精确翻译，报错终止并提示用户补充 `gpu_output`
+
+3. **构建输入函数**
+   - `get_inputs()`：按 kernel 参数顺序从 `input_data` 构造列表，返回 `[tensor1, tensor2, scalar1, ...]`
+   - `get_init_inputs()`：返回 `[]`
+   - 常量参数（如 `HEAD_DIM`, `N_ROUNDED`, `IS_BASE_E`）若存在于 `input_data` 中，一并作为 `get_inputs()` 的返回值
+
+4. **验证 task_desc.py**
+   - 保存 `{工作目录}/{op_name}.py`
+   - 使用 `op-task-extractor/scripts/validate_task.py` 进行静态+运行时验证
+   - 若验证失败，最多重试 2 次修复 `Model` 翻译错误
+   - 验证通过后进入 Phase 2
 
 验证通过后直接进入 Phase 2。
 
@@ -147,6 +192,10 @@ while iteration < max_iterations:
       删除 {工作目录}/output/generated_code.py（如存在）
       → 跳到 3.4 Conductor
 
+    **GPU Kernel 模式下的特殊处理**：
+    - 若 `Model` 为首选方案（直接返回 `gpu_output`），`verify.py` 的精度比对天然通过，但 `framework` 延迟不具备实际意义，应在报告中明确标注。
+    - 若 `Model` 为兜底方案（手写的 PyTorch 参考实现），正常走 `verify.py` 的精度比对流程。
+
     ── 3.4 Conductor 分析与决策 ──────────────────────
     (Agent 自身推理，非 Skill 调用)
 
@@ -168,6 +217,8 @@ while iteration < max_iterations:
 
     ── 3.5 性能测试 ──────────────────────────────────
     调用 kernel-verifier skill (benchmark.py)
+
+    **GPU Kernel 模式**：需附加 `--skip_framework --framework_latency_ms <gpu_reference_ms>`，其中 `gpu_reference_ms` 由 `vllm_gpu_perf.csv` 中的 `Duration(us)` 转换而来（除以 1000）。避免对无意义的预存 GPU 输出 Model 进行 profiling。
 
     产物 → {工作目录}/output/iter_{iteration}/perf_result.json
     复制 → {工作目录}/output/perf_result.json
@@ -274,9 +325,11 @@ while opt_iteration < max_opt_iterations:
     ── 4.3 双重性能测试 ──────────────────────────────
     调用 kernel-verifier skill (benchmark.py) 两次
 
-    第一次: benchmark --triton_impl_name triton_baseline
+    **GPU Kernel 模式**：两次 benchmark 均需附加 `--skip_framework --framework_latency_ms <gpu_reference_ms>`，其中 `gpu_reference_ms` 从 `vllm_gpu_perf.csv` 读取并转换为毫秒。非 GPU 模式保持原样。
+
+    第一次: benchmark.py --triton_impl_name triton_baseline [--skip_framework ...]
       → baseline_perf_result.json
-    第二次: benchmark --triton_impl_name triton_optimized
+    第二次: benchmark.py --triton_impl_name triton_optimized [--skip_framework ...]
       → optimized_perf_result.json
 
     计算 speedup_vs_baseline = baseline_latency / optimized_latency
@@ -324,6 +377,10 @@ while opt_iteration < max_opt_iterations:
 **写入 `{工作目录}/report.md`**：
 - 基本信息：arch、工作目录
 - 生成结果：迭代次数、最终版本来源
+- **GPU 参考性能**（仅在 GPU Kernel 模式下且找到 `gpu_perf_csv` 时显示）：
+  - GPU 参考延迟
+  - Ascend Triton 延迟
+  - Ascend/GPU 倍数
 - 性能数据：加速比、延迟
 - 性能明细：读取 `output/perf_result.json` 中的 `per_shape_results`（如 `total_cases == 1`，则显示单条记录；多 shape 时显示多行），
   以 Markdown 表格形式输出各 shape 的 framework 延迟、implementation 延迟和 speedup。
@@ -331,9 +388,9 @@ while opt_iteration < max_opt_iterations:
 
 **写入 `{工作目录}/summary.json`**：
 
-**注意**：多 Shape 场景下，`summary.json` 的 `perf_data` 应为 **汇总的平均指标**，包含 `total_cases` 和 `per_shape_results`。批量评测脚本（如 `run_benchmark_triton.sh`）会通过读取 `summary.json` 来生成 `batch_report.md`，因此必须确保多 Shape 数据正确写入。
+**注意**：多 Shape 场景下，`summary.json` 的 `perf_data` 应为 **汇总的平均指标**，包含 `total_cases` 和 `per_shape_results`。批量评测脚本（如 `run_benchmark_triton.sh`）会通过读取 `summary.json` 来生成 `batch_report.md`，因此必须确保多 Shape 数据正确写入，且**原有字段完整保留**。
 
-成功时：
+成功时标准格式：
 ```json
 {
   "success": true,
@@ -344,19 +401,52 @@ while opt_iteration < max_opt_iterations:
   "skill_path": ".claude/skills/kernel-verifier",
   "perf_data": {
     "avg_latency_ms": 0.5678,
-    "speedup_vs_torch": 2.17,
+    "speedup_vs_torch": 2.1700,
     "speedup_vs_baseline": 1.35,
     "total_cases": 5,
     "per_shape_results": [
-      {"shape": [128], "speedup_vs_torch": 1.82},
-      {"shape": [256, 256], "speedup_vs_torch": 2.15},
-      {"shape": [1024, 1024], "speedup_vs_torch": 2.31}
+      {"shape": [128], "speedup_vs_torch": 1.8200},
+      {"shape": [256, 256], "speedup_vs_torch": 2.1500},
+      {"shape": [1024, 1024], "speedup_vs_torch": 2.3100}
     ]
   }
 }
 ```
 
-**说明**：`total_cases` 表示测试的 Shape 数量，当 `total_cases > 1` 时，需要在 `per_shape_results` 中记录每个 Shape 的性能数据。批量评测报告需要读取这些信息来显示多 Shape 汇总。
+**GPU Kernel 模式扩展格式**（向后兼容）：
+```json
+{
+  "success": true,
+  "gen_iterations": 1,
+  "opt_iterations": 2,
+  "optimized": false,
+  "perf_method": "profiler",
+  "skill_path": ".claude/skills/kernel-verifier",
+  "gpu_mode": true,
+  "perf_data": {
+    "avg_latency_ms": 0.4200,
+        "speedup_vs_torch": 0.3700,
+    "gpu_reference_ms": 0.002072,
+    "ascend_vs_gpu_ratio": 202.7,
+    "total_cases": 1,
+    "per_shape_results": [
+      {
+        "shape": [128, 16, 128],
+    "speedup_vs_torch": 0.3700,
+        "gpu_reference_ms": 0.002072,
+        "ascend_vs_gpu_ratio": 202.7
+      }
+    ]
+  }
+}
+```
+
+**字段说明**：
+- `gpu_mode`: `true` 表示本次任务源自 GPU Kernel 输入模式
+- `perf_data.gpu_reference_ms`: 从 `vllm_gpu_perf.csv` 读取的 GPU 参考延迟（毫秒）
+- `perf_data.ascend_vs_gpu_ratio`: Ascend Triton 延迟 / GPU 延迟 的倍数
+- `per_shape_results` 中的每个元素也包含 `gpu_reference_ms` 和 `ascend_vs_gpu_ratio`
+- **所有原有字段必须完整保留**，确保批量评测脚本不受破坏
 
 Phase 3 失败时：
 ```json
@@ -378,7 +468,7 @@ Phase 4 失败时（Phase 3 成功，优化未成功）：
   "optimized": false,
   "perf_data": {
     "avg_latency_ms": 0.8000,
-    "speedup_vs_torch": 1.50
+    "speedup_vs_torch": 1.5000
   }
 }
 ```
@@ -426,7 +516,9 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 
 | 阶段 | 错误 | 处理 |
 |------|------|------|
-| Phase 1 | 任务文件验证失败 | 修复重试（最多 2 次） |
+| Phase 1 (模式 A) | 任务文件验证失败 | 修复重试（最多 2 次） |
+| Phase 1 (模式 B) | `.pt` 文件不存在 | 报错终止，提示用户上传同名 `.pt` |
+| Phase 1 (模式 B) | `Model` 翻译验证失败 | 修复重试（最多 2 次） |
 | Phase 3 | 达到 max_iterations | 输出失败报告，任务结束 |
 | Phase 3 | B 类环境错误 | 立即终止，任务失败 |
 | Phase 3 | C 类重复错误 | 立即终止，任务失败 |
@@ -439,6 +531,7 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 
 | 约束 | 说明 |
 |------|------|
+| GPU Kernel 模式 | `.pt` 必须与 `.py` 同名同目录；`vllm_gpu_perf.csv` 向上查找最多 3 级 |
 | Phase 3 最大迭代 | 5 次，禁止超出 |
 | Phase 4 最大迭代 | 3 次，禁止超出 |
 | Phase 4 成功底线 | 性能超过基线 Triton 实现 5% |
