@@ -86,6 +86,14 @@ def get_input_groups():
                 elif inp['type'] == 'attr':
                     tensors[inp['name']] = inp['value']
 
+            # Clamp k and p to valid ranges for npu_top_k_top_p
+            if 'logits' in tensors and tensors['logits'] is not None:
+                N = tensors['logits'].shape[-1]
+                if 'k' in tensors and tensors['k'] is not None:
+                    tensors['k'] = tensors['k'].clamp(min=1, max=min(1024, N))
+                if 'p' in tensors and tensors['p'] is not None:
+                    tensors['p'] = torch.rand(tensors['p'].shape, dtype=tensors['p'].dtype)
+
             # Build input list in order matching forward signature
             group = []
             for inp in inputs:
