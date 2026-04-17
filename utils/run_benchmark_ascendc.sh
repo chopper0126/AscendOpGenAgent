@@ -323,7 +323,7 @@ echo "================================================================"
 echo "正在调用 generate_report_dynamic.py 生成详细报告..."
 echo "================================================================"
 # 请根据你的文件实际路径调整下面这一行
-python3 generate_report_dynamic.py -i "$OUTPUT_DIR" -o "$OUTPUT_DIR/../final_batch_report.md"
+python3 utils/generate_report_dynamic.py -i "$OUTPUT_DIR" -o "$OUTPUT_DIR/final_batch_report.md"
 
 
 # 最后的结束语
