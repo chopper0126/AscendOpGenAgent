@@ -290,10 +290,10 @@ bash utils/run_benchmark_ascendc.sh \
 ### 评测基线
 
 #### Triton
-关于 Triton 的相关数据，请参阅[`benchmarks/BASELINE_0408.md`](benchmarks/BASELINE_0408.md)
+关于 Triton 的相关数据，请参阅[`benchmarks/BASELINE_latest.md`](benchmarks/BASELINE_latest.md)
 
 #### AscendC
-关于 AscendC 的相关数据，请参阅[`benchmarks/BASELINE_0408.md`](benchmarks/BASELINE_0415.md) 
+关于 AscendC 的相关数据，请参阅[`benchmarks/BASELINE_latest.md`](benchmarks/BASELINE_latest.md) 
 
 
 
