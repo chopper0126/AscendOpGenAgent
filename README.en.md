@@ -291,11 +291,11 @@ bash utils/run_benchmark_ascendc.sh \
 
 #### Triton
 
-Please refer to [`benchmarks/BASELINE_0408.md`](benchmarks/BASELINE_0408.md) for Triton-related data.
+Please refer to [`benchmarks/BASELINE_latest.md`](benchmarks/BASELINE_latest.md) for Triton-related data.
 
 #### AscendC
 
-Please refer to [`benchmarks/BASELINE_0408.md`](benchmarks/BASELINE_0408.md) for AscendC-related data.
+Please refer to [`benchmarks/BASELINE_latest.md`](benchmarks/BASELINE_latest.md) for AscendC-related data.
 
 ## Project Structure
 
