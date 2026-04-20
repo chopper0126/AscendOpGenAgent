@@ -182,6 +182,55 @@ x = tl.load(
 | `grid = (M,)` | `grid = (triton.cdiv(M, ROWS_PER_BLOCK),)` |
 | 1D 索引 `ptr + row_id * stride` | 2D 索引 `ptr + row_offs[:, None] * stride` |
 
+### 常见错误：用外层 for 循环串行处理多行
+
+**问题代码**：试图让每个 program 处理多行数据，但错误地使用了外层 for 循环串行处理。
+
+```python
+# 错误：每个 program 通过外层循环串行处理多个 expert
+# 导致每个 program 重复遍历输入数据多次
+pid = tl.program_id(0)
+experts_per_core = tl.cdiv(num_experts, NUM_CORES)
+start_expert = pid * experts_per_core
+
+for _ in range(experts_per_core):
+    curr_expert = ...
+    for x in range(tl.cdiv(topk_numel, BLOCK_SIZE)):
+        expert_ids = tl.load(topk_ids_ptrs, ...)
+        # ... 重复遍历 topk_numel
+    curr_expert += 1
+```
+
+**性能劣化原因**：
+- 每个 program 将 `topk_ids` 重复加载 `experts_per_core` 次
+- 虽然 grid 变小了，但每个 program 的访存量线性增加
+- 计算密度没有提升，访存带宽却成倍增加
+
+**正确做法**：使用 2D 向量化 + 广播，让每个 program 在一次遍历中并行处理多行数据。
+
+```python
+# 正确：每个 program 同时处理 EXPERT_BLOCK 个 expert
+pid = tl.program_id(0)
+curr_expert = pid * EXPERT_BLOCK + tl.arange(0, EXPERT_BLOCK)  # 向量索引
+
+acc = tl.zeros((EXPERT_BLOCK, BLOCK_SIZE), dtype=tl.float32)
+for x in range(cntx):
+    mask = offsets < (topk_numel - x * BLOCK_SIZE)
+    expert_ids = tl.load(topk_ids_ptr + x * BLOCK_SIZE + offsets, mask=mask, other=-1)
+    # 广播：(EXPERT_BLOCK, 1) == (1, BLOCK_SIZE) -> (EXPERT_BLOCK, BLOCK_SIZE)
+    has_curr_expert = (expert_ids[None, :] == curr_expert[:, None]).to(tl.float32)
+    acc = acc + has_curr_expert
+
+# 每行一个结果
+result = tl.sum(acc, axis=1)
+tl.store(expert_num_tokens_ptr + curr_expert, result)
+```
+
+**关键差异**：
+- 错误方式：外层 for 循环串行处理 `experts_per_core` 个 expert，每个 expert 独立遍历输入
+- 正确方式：通过广播将 `EXPERT_BLOCK` 个 expert 的比较同时向量化，**只遍历一次**输入数据
+- Grid = `(num_experts // EXPERT_BLOCK,)`，每个 program 的计算密度提升 `EXPERT_BLOCK` 倍
+
 ### 模板代码
 
 #### 模式 1: Row-wise Reduction (softmax, row-max, row-sum)

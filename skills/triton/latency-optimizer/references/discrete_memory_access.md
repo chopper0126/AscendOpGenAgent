@@ -170,6 +170,41 @@ val = tl.gather(x_shared.to(tl.float16), idx, 0).to(tl.int32)  # 再从share中s
 2. **自动优化**：将 `tl.load`的输入指针中的随机值剔除，改为读取一大块内存（注意不能超过share memory限制），然后使用`tl.gather`输入随机值，得到最终需要取的值
 3. **注意gather的数据类型**：`tl.gather`不支持`int类型`，最好将输入强转成`tl.float16`再执行`tl.gather`,最后再转回原有的数据类型。如果提示精度报错，可以尝试强转成`tl.float32`。
 
+### 模式 2：循环内通过随机索引访问小查找表
+
+**问题代码（极易误判）**：
+
+```python
+for x in range(tl.cdiv(topk_numel, BLOCK_SIZE)):
+    mask = offsets < (topk_numel - x * BLOCK_SIZE)
+    expert_ids = tl.load(topk_ids_ptrs, mask=mask, other=-1)
+    if HAS_EXPERT_MAP:
+        # 错误：expert_ids 来自 tl.load，是运行时随机值
+        # expert_map + expert_ids 产生随机全局内存访问，每次循环迭代都可能跨步
+        expert_map_ptrs = expert_map + expert_ids
+        expert_ids = tl.load(expert_map_ptrs, mask=mask, other=-1)
+    ...
+```
+
+**优化后代码**：
+
+```python
+# 循环外一次性将 expert_map（小查找表）加载到 UB
+expert_map_data = tl.load(expert_map + tl.arange(0, num_experts)).to(tl.float32)
+for x in range(cntx):
+    mask = offsets < (topk_numel - x * BLOCK_SIZE)
+    e_ids = tl.load(topk_ids_ptr + x * BLOCK_SIZE + offsets, mask=mask, other=0)
+    # 对 UB 中的局部 buffer 使用 gather，替代全局离散加载
+    expert_ids = tl.gather(expert_map_data, e_ids, 0)
+    ...
+```
+
+**关键差异**：
+- 原始版本：每次循环迭代执行 `tl.load(expert_map + expert_ids)`，索引 `expert_ids` 随机，导致全局离散访存
+- 优化版本：循环外一次 `tl.load` 将 expert_map 整体搬到 UB，循环内用 `tl.gather` 从 UB 局部查找
+
+**识别要点**：当代码出现 `tl.load(small_table + tl.load(random_indices))` 这种"双层加载-索引"模式时，几乎总是可以通过"预加载 + gather"优化。
+
 
 ## 性能收益
 
