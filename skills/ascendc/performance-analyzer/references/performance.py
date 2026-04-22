@@ -322,6 +322,28 @@ def _print_report(report):
         else:
             print(f"error      : {result['error']}")
 
+    # Print per-case speedup summary
+    ref_result = next((r for r in report["results"] if r["impl"] == "reference" and r["ok"]), None)
+    asc_result = next((r for r in report["results"] if r["impl"] == "ascendc" and r["ok"]), None)
+    if ref_result and asc_result:
+        print("-" * 88)
+        print("Per-Case Speedup (reference / ascendc)")
+        print("-" * 88)
+        print(f"{'Case':<8} {'Ref(ms)':>12} {'AscendC(ms)':>14} {'Speedup':>10}")
+        print("-" * 88)
+        for ref_case, asc_case in zip(ref_result["case_results"], asc_result["case_results"]):
+            idx = ref_case["index"]
+            ref_mean = ref_case["mean_ms"]
+            asc_mean = asc_case["mean_ms"]
+            speedup = ref_mean / asc_mean if asc_mean > 0 else float("inf")
+            print(f"[{idx:<5}] {ref_mean:>12.3f} {asc_mean:>14.3f} {speedup:>10.2f}x")
+        print("-" * 88)
+        overall_ref = ref_result["mean_ms"]
+        overall_asc = asc_result["mean_ms"]
+        overall_speedup = overall_ref / overall_asc if overall_asc > 0 else float("inf")
+        print(f"Overall  : ref_mean={overall_ref:.3f} ms, asc_mean={overall_asc:.3f} ms, speedup={overall_speedup:.2f}x")
+        print("=" * 88)
+
 
 def _parse_args(argv):
     if len(argv) < 2 or len(argv) > 6:
