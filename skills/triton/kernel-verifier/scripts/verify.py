@@ -15,13 +15,58 @@ import subprocess
 
 
 def get_limit(data_type):
-    """根据数据类型获取精度阈值 - 使用 2 的幂次方阈值（与 NPU Benchmark 标准一致）"""
+    """根据数据类型获取精度阈值 - 使用 2 的幂次方阈值（与 NPU Benchmark 标准一致）
+
+    参考文档: 精度对比方法.md
+    数据类型: FLOAT16, BFLOAT16, FLOAT32, HiFloat32, FLOAT8 E4M3, FLOAT8 E5M2
+    判定标准: MERE < threshold 且 MARE < 10 * threshold
+
+    阈值表:
+    | 数据类型      | 阈值 (2^n)      | 十进制值       |
+    |--------------|----------------|---------------|
+    | FLOAT16      | 2^{-10}        | 0.0009765625  |
+    | BFLOAT16     | 2^{-7}         | 0.0078125     |
+    | FLOAT32      | 2^{-13}        | 0.0001220703  |
+    | HiFloat32    | 2^{-11}        | 0.0004882812  |
+    | FLOAT8 E4M3  | 2^{-3}         | 0.125         |
+    | FLOAT8 E5M2  | 2^{-2}         | 0.25          |
+
+    由于 torch.dtype 中没有直接定义 HiFloat32，可通过字符串传入 "hifloat32" 获取对应阈值。
+    """  # noqa: E501
     import torch
+
+    # 支持字符串类型（用于 HiFloat32 或其他自定义类型）
+    if isinstance(data_type, str):
+        str_to_threshold = {
+            "float16": 2**(-10),
+            "bfloat16": 2**(-7),
+            "float32": 2**(-13),
+            "hifloat32": 2**(-11),
+            "float8_e4m3": 2**(-3),
+            "float8_e5m2": 2**(-2),
+            "fp8_e4m3": 2**(-3),
+            "fp8_e5m2": 2**(-2),
+        }
+        return str_to_threshold.get(data_type.lower(), 2**(-13))
+
+    # torch.dtype 类型映射
     dtype_threshold_map = {
-        torch.float16: 2**(-10),    # 0.0009765625
-        torch.bfloat16: 2**(-7),    # 0.0078125
-        torch.float32: 2**(-13),    # 0.0001220703125
+        torch.float16: 2**(-10),    # FLOAT16
+        torch.bfloat16: 2**(-7),    # BFLOAT16
+        torch.float32: 2**(-13),    # FLOAT32
     }
+
+    # 安全获取 FP8 类型（PyTorch 2.0+ 支持）
+    # FLOAT8 E4M3: 2^{-3}
+    float8_e4m3 = getattr(torch, 'float8_e4m3fn', None) or getattr(torch, 'float8_e4m3', None)
+    if float8_e4m3 is not None:
+        dtype_threshold_map[float8_e4m3] = 2**(-3)
+
+    # FLOAT8 E5M2: 2^{-2}
+    float8_e5m2 = getattr(torch, 'float8_e5m2fn', None) or getattr(torch, 'float8_e5m2', None)
+    if float8_e5m2 is not None:
+        dtype_threshold_map[float8_e5m2] = 2**(-2)
+
     return dtype_threshold_map.get(data_type, 2**(-13))
 
 
