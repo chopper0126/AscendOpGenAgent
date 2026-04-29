@@ -45,7 +45,9 @@ def get_input_groups():
         x_dtype = dtype_map[x_info["dtype"]]
 
         g = torch.randn(g_info["shape"], dtype=g_dtype)
-        x = torch.randn(x_info["shape"], dtype=x_dtype)
+        x = torch.empty(x_info["shape"]).uniform_(-5, 5)                                                                                                                                                                                                                                                                               
+        mask = (x >= -1.2) & (x <= -1.18)                                                                                           
+        x[mask] = x[mask] - 3.8
         input_groups.append([g, x])
     return input_groups
 
