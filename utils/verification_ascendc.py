@@ -53,7 +53,7 @@ def _compute_mere(actual: torch.Tensor, golden: torch.Tensor, threshold: float, 
     diff = (actual - golden).abs()
     rel = diff / (golden.abs() + eps)
     # 绝对误差已在阈值内的元素，不计入相对误差
-    rel = torch.where(diff < threshold, 0.0, rel)
+    rel = torch.where(diff < threshold * 1e-3, 0.0, rel)
     if rel.numel() == 0:
         return 0.0
     return float(rel.mean().item())
@@ -69,7 +69,7 @@ def _compute_mare(actual: torch.Tensor, golden: torch.Tensor, threshold: float, 
     """
     diff = (actual - golden).abs()
     rel = diff / (golden.abs() + eps)
-    rel = torch.where(diff < threshold, 0.0, rel)
+    rel = torch.where(diff < threshold * 1e-3, 0.0, rel)
     if rel.numel() == 0:
         return 0.0
     return float(rel.max().item())
