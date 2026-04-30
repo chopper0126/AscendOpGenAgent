@@ -42,25 +42,34 @@ INT_LSB_TOLERANCE = {
 }
 
 
-def _compute_mere(actual: torch.Tensor, golden: torch.Tensor, eps: float = 1e-7) -> float:
+def _compute_mere(actual: torch.Tensor, golden: torch.Tensor, threshold: float, eps: float = 1e-7) -> float:
     """计算平均相对误差 (Mean Relative Error).
 
     MERE = mean(|actual - golden| / (|golden| + eps))
+
+    对于绝对误差已经小于阈值的元素，相对误差直接视为 0，
+    避免因 golden 值极小导致相对误差被不合理放大。
     """
     diff = (actual - golden).abs()
     rel = diff / (golden.abs() + eps)
+    # 绝对误差已在阈值内的元素，不计入相对误差
+    rel = torch.where(diff < threshold, 0.0, rel)
     if rel.numel() == 0:
         return 0.0
     return float(rel.mean().item())
 
 
-def _compute_mare(actual: torch.Tensor, golden: torch.Tensor, eps: float = 1e-7) -> float:
+def _compute_mare(actual: torch.Tensor, golden: torch.Tensor, threshold: float, eps: float = 1e-7) -> float:
     """计算最大相对误差 (Max Relative Error).
 
     MARE = max(|actual - golden| / (|golden| + eps))
+
+    对于绝对误差已经小于阈值的元素，相对误差直接视为 0，
+    避免因 golden 值极小导致相对误差被不合理放大。
     """
     diff = (actual - golden).abs()
     rel = diff / (golden.abs() + eps)
+    rel = torch.where(diff < threshold, 0.0, rel)
     if rel.numel() == 0:
         return 0.0
     return float(rel.max().item())
@@ -140,8 +149,8 @@ def _check_precision_mere_mare(actual: torch.Tensor, golden: torch.Tensor) -> tu
         # 所有元素均为双 NaN 或双 Inf
         return True, 0.0, 0.0, threshold, mare_threshold
 
-    mere = _compute_mere(actual_valid, golden_valid)
-    mare = _compute_mare(actual_valid, golden_valid)
+    mere = _compute_mere(actual_valid, golden_valid, threshold)
+    mare = _compute_mare(actual_valid, golden_valid, threshold)
 
     passed = mere < threshold and mare < mare_threshold
     return passed, mere, mare, threshold, mare_threshold
