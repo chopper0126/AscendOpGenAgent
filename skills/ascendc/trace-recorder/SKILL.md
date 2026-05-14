@@ -39,6 +39,7 @@ argument-hint: >
 
 - 时间: {当前日期时间}
 - 算子: {output_dir 对应的算子名}
+- 设计路径: {design.md (简单算子) / TileLang (复杂算子)}
 - 最终结果: SKIP / PASS / FAIL (tilelang) | PASS / FAIL (ascendc)
 
 ## 阶段零: Case 精简
@@ -48,7 +49,13 @@ argument-hint: >
 - 精简后 case 数: {n}
 - 备注: {如有异常情况}
 
-## 阶段一: TileLang
+## 阶段〇.五: 设计文档 (仅简单算子路径)
+
+- 结果: 通过 / 失败 / 跳过
+- 说明: 简单算子路径生成 design/design.md；复杂算子路径填写"跳过(走 TileLang 路径)"
+- 备注: {如设计文档修正次数}
+
+## 阶段一: TileLang (仅复杂算子路径)
 
 - 结果: 通过 / 失败 / 跳过
 - evaluate_tilelang.sh 执行次数: {n}
@@ -62,6 +69,9 @@ argument-hint: >
 ## 阶段二: AscendC
 
 - 结果: 通过 / 失败
+- 设计路径: design.md (简单算子) / TileLang 转译 (复杂算子)
+- 产物: kernel/op_host/<op>.cpp, kernel/op_kernel/<op>.cpp, kernel/ops.h, kernel/register.cpp
+- 编译: evaluate_ascendc.sh (cmake + make + whl)
 - evaluate_ascendc.sh 执行次数: {n}
 - 关键错误信息: {评测脚本返回的错误，原文引用}
 - Agent 行为记录:

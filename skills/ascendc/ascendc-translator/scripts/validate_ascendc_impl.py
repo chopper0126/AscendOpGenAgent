@@ -104,6 +104,12 @@ ASCENDC_EXT_PATTERNS = [
     re.compile(r"_ext$"),               # _ext
 ]
 
+# torch.ops.load_library 调用模式（新的 whl/torch.ops 注册路径）
+TORCH_OPS_LOAD_LIBRARY_PATTERNS = [
+    re.compile(r"torch\.ops\.load_library"),
+    re.compile(r"torch\.ops\.npu\."),
+]
+
 
 # ---------------------------------------------------------------------------
 # AST 辅助函数
@@ -114,18 +120,23 @@ def _resolve_call_name(node):
 
     返回 (qualifier, attr) 或 (None, name) 或 None。
     例如：torch.empty -> ('torch', 'empty')
+          torch.ops.npu.rms_norm -> ('torch.ops.npu', 'rms_norm')
           _ext.run_kernel -> ('_ext', 'run_kernel')
           my_func -> (None, 'my_func')
     """
     func = node.func if isinstance(node, ast.Call) else node
     if isinstance(func, ast.Attribute):
-        if isinstance(func.value, ast.Name):
-            return (func.value.id, func.attr)
-        # 处理 torch.nn.functional.relu 形式
-        if isinstance(func.value, ast.Attribute):
-            inner = func.value
-            if isinstance(inner.value, ast.Name):
-                return (f"{inner.value.id}.{inner.attr}", func.attr)
+        parts = []
+        current = func
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+            parts.reverse()
+            qual = ".".join(parts[:-1])
+            attr = parts[-1]
+            return (qual, attr) if qual else (None, attr)
     if isinstance(func, ast.Name):
         return (None, func.id)
     return None
@@ -208,6 +219,23 @@ def find_ascendc_extension_imports(tree):
                             "is_placeholder": False,
                             "import_style": "importlib",
                         }
+
+    # --- torch.ops.load_library 动态加载检测 (新 whl 注册路径) ---
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            resolved = _resolve_call_name(node.value)
+            if resolved:
+                qual, attr = resolved
+                if (qual == "torch.ops" and attr == "load_library") or \
+                   (qual is None and attr == "load_library"):
+                    # torch.ops.load_library("kernel/build/lib<op>.so")
+                    extensions["torch.ops.npu"] = {
+                        "name": "torch.ops.npu",
+                        "alias": None,
+                        "line": node.lineno,
+                        "is_placeholder": False,
+                        "import_style": "torch_ops_load_library",
+                    }
 
     return extensions
 
@@ -314,6 +342,10 @@ def check_forbidden_torch_ops(forward_node):
             continue
 
         qual, attr = resolved
+
+        # --- torch.ops.npu.* / torch.ops.load_library — 允许 (AscendC 注册路径) ---
+        if qual and (qual == "torch.ops.npu" or qual.startswith("torch.ops.npu.") or qual == "torch.ops"):
+            continue
 
         # --- torch.xxx(...) ---
         if qual == "torch":
@@ -541,12 +573,13 @@ def validate(code, filepath="<unknown>"):
 
     if not ext_names:
         result["checks"]["ascendc_ext_imported"]["error"] = (
-            "未找到任何 AscendC 扩展模块导入（如 import _xxx_ext）"
+            "未找到任何 AscendC 扩展模块导入（如 torch.ops.load_library 或 import _xxx_ext）"
         )
         result["regression_type"] = 1
         result["suggestion"] = (
-            "代码中没有导入 AscendC 扩展模块。model_new_ascendc.py 必须导入编译好的 "
-            "AscendC kernel 扩展（如 import _xxx_ext），并在 forward() 中调用其函数完成计算。"
+            "代码中没有加载 AscendC kernel 扩展。model_new_ascendc.py 必须通过 "
+            "torch.ops.load_library('kernel/build/lib<op>.so') 加载编译好的 AscendC kernel，"
+            "并在 forward() 中通过 torch.ops.npu.<op_name>(...) 调用。"
         )
         return result
 
@@ -588,14 +621,15 @@ def validate(code, filepath="<unknown>"):
 
     if not called:
         result["checks"]["kernel_called_from_forward"]["error"] = (
-            f"已导入扩展模块 {list(valid_ext_names)} 但 {class_name}.forward() "
-            f"未调用任何扩展函数"
+            f"已加载扩展 {list(valid_ext_names)} 但 {class_name}.forward() "
+            f"未调用任何 kernel 函数"
         )
         result["regression_type"] = 2
         result["suggestion"] = (
-            f"已导入 AscendC 扩展模块 {list(valid_ext_names)} 但 "
+            f"已加载 AscendC kernel 扩展 {list(valid_ext_names)} 但 "
             f"{class_name}.forward() 中未调用。"
-            "forward() 必须通过 ext_module.function_name(...) 形式调用 kernel。"
+            "forward() 必须通过 torch.ops.npu.<op_name>(...) 形式调用 kernel，"
+            "或通过 ext_module.function_name(...) 调用。"
             f"{'也存在 wrapper 函数 ' + str(list(wrapper_names)) + ' 但 forward 也未调用它们。' if wrapper_names else ''}"
         )
         return result

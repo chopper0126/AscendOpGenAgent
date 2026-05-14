@@ -27,17 +27,10 @@ WORKDIR="$(find_workdir)" || {
   exit 1
 }
 
-SSH_TARGET="${SSH_TARGET:-ascend-box}"
-REMOTE_PORT="${REMOTE_PORT:-}"
-SSH_KEY="${SSH_KEY:-}"
-
-REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-/root/tilelang_eval}"
-CONTAINER_NAME="${CONTAINER_NAME:-zyy_cann}"
-CONTAINER_WORKDIR="${CONTAINER_WORKDIR:-/home/z00893531/tilelang-ascend}"
-REMOTE_EVAL_WORKDIR="${REMOTE_EVAL_WORKDIR:-workdir_remote_eval}"
 ASCENDC_SOC_VERSION="${ASCENDC_SOC_VERSION:-Ascend910B3}"
 ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-3}"
 ASCENDC_CLEAN_BUILD="${ASCENDC_CLEAN_BUILD:-1}"
+BUILD_TYPE="${BUILD_TYPE:-Release}"
 
 usage() {
   cat <<'EOF'
@@ -47,24 +40,15 @@ Arguments:
   task    Task directory to verify. Defaults to current_task.
 
 Environment overrides:
-  SSH_TARGET                 SSH host or ~/.ssh/config alias
-  REMOTE_PORT                Optional SSH port override
-  SSH_KEY                    Optional SSH identity file override
-  REMOTE_BASE_DIR            Host path used to store uploaded workdir
-  CONTAINER_NAME             Target docker container name
-  CONTAINER_WORKDIR          Project root inside the container
-  REMOTE_EVAL_WORKDIR        Working directory name used inside the container
-  ASCENDC_SOC_VERSION        SoC passed to utils/build_ascendc.py
-  ASCEND_RT_VISIBLE_DEVICES  Device id used inside the container
-  ASCENDC_CLEAN_BUILD        Defaults to 1. Removes task/kernel/build before rebuilding,
-                             and replaces the remote eval workdir before syncing
+  ASCENDC_SOC_VERSION        SoC version (default: Ascend910B3)
+  ASCEND_RT_VISIBLE_DEVICES  Device id (default: 3)
+  ASCENDC_CLEAN_BUILD        Clean build before compiling (default: 1)
+  BUILD_TYPE                 CMake build type (default: Release)
 
 Examples:
   bash <path-to-ascendc-translator>/references/evaluate_ascendc.sh
   bash <path-to-ascendc-translator>/references/evaluate_ascendc.sh current_task
-  REMOTE_EVAL_WORKDIR=workdir_remote_eval_wzz bash <path-to-ascendc-translator>/references/evaluate_ascendc.sh quant_matmul
   ASCENDC_SOC_VERSION=Ascend910B3 bash <path-to-ascendc-translator>/references/evaluate_ascendc.sh current_task
-  ASCENDC_CLEAN_BUILD=1 bash <path-to-ascendc-translator>/references/evaluate_ascendc.sh matmul_leakyrelu
 EOF
 }
 
@@ -74,11 +58,6 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 TASK="${1:-current_task}"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-ARCHIVE_NAME="workdir_${TIMESTAMP}.tar.gz"
-LOCAL_ARCHIVE="/tmp/${ARCHIVE_NAME}"
-REMOTE_ARCHIVE="/tmp/${ARCHIVE_NAME}"
-REMOTE_SESSION_DIR="${REMOTE_BASE_DIR}/${TIMESTAMP}"
 
 PYTHONPATH_PREFIX="${WORKDIR}"
 if [[ -d "${WORKDIR}/archive_tasks" ]]; then
@@ -87,11 +66,6 @@ fi
 
 if [[ ! -f "${WORKDIR}/utils/verification_ascendc.py" ]]; then
   echo "Missing verification script: ${WORKDIR}/utils/verification_ascendc.py" >&2
-  exit 1
-fi
-
-if [[ ! -f "${WORKDIR}/utils/build_ascendc.py" ]]; then
-  echo "Missing build script: ${WORKDIR}/utils/build_ascendc.py" >&2
   exit 1
 fi
 
@@ -112,113 +86,37 @@ if [[ ! -d "${TASK_DIR}/kernel" ]]; then
   exit 1
 fi
 
-if python -c 'import torch; import torch_npu' >/dev/null 2>&1; then
-  echo "Detected local Ascend environment, building kernel and running local verification"
-  cd "${WORKDIR}"
-  if [[ "${ASCENDC_CLEAN_BUILD}" == "1" ]]; then
-    PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
-      python utils/build_ascendc.py "${TASK_DIR}" -v "${ASCENDC_SOC_VERSION}" --clean
-  else
-    PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
-      python utils/build_ascendc.py "${TASK_DIR}" -v "${ASCENDC_SOC_VERSION}"
-  fi
-  PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
-    ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" \
-    python utils/verification_ascendc.py "${TASK_DIR}"
-  exit 0
+echo "Building kernel and running local verification"
+
+KERNEL_DIR="${TASK_DIR}/kernel"
+BUILD_DIR="${KERNEL_DIR}/build"
+
+# Source CANN environment
+if [[ -n "${ASCEND_HOME_PATH:-}" ]]; then
+  source "${ASCEND_HOME_PATH}/set_env.sh" 2>/dev/null || true
 fi
 
-SSH_OPTS=()
-SCP_OPTS=()
-if [[ -n "${REMOTE_PORT}" ]]; then
-  SSH_OPTS+=(-p "${REMOTE_PORT}")
-  SCP_OPTS+=(-P "${REMOTE_PORT}")
-fi
-
-if [[ -n "${SSH_KEY}" ]]; then
-  if [[ ! -f "${SSH_KEY}" ]]; then
-    echo "SSH key not found: ${SSH_KEY}" >&2
-    exit 1
-  fi
-  SSH_OPTS+=(-i "${SSH_KEY}")
-  SCP_OPTS+=(-i "${SSH_KEY}")
-fi
-
-SSH_CMD=(ssh)
-SCP_CMD=(scp)
-if [[ ${#SSH_OPTS[@]} -gt 0 ]]; then
-  SSH_CMD+=("${SSH_OPTS[@]}")
-fi
-if [[ ${#SCP_OPTS[@]} -gt 0 ]]; then
-  SCP_CMD+=("${SCP_OPTS[@]}")
-fi
-
-cleanup() {
-  rm -f "${LOCAL_ARCHIVE}"
-}
-trap cleanup EXIT
-
-echo "[1/4] Packaging ${WORKDIR}"
-tar \
-  --exclude=".git" \
-  --exclude="__pycache__" \
-  --exclude=".DS_Store" \
-  --exclude=".pytest_cache" \
-  --exclude=".mypy_cache" \
-  --exclude=".ruff_cache" \
-  -C "${WORKDIR}" \
-  -czf "${LOCAL_ARCHIVE}" \
-  .
-
-echo "[2/4] Uploading archive to ${SSH_TARGET}:${REMOTE_ARCHIVE}"
-"${SCP_CMD[@]}" \
-  "${LOCAL_ARCHIVE}" \
-  "${SSH_TARGET}:${REMOTE_ARCHIVE}"
-
-read -r -d '' REMOTE_SCRIPT <<EOF || true
-set -euo pipefail
-cleanup_remote() {
-  rm -rf "${REMOTE_SESSION_DIR}"
-}
-trap cleanup_remote EXIT
-
-mkdir -p "${REMOTE_SESSION_DIR}"
-tar -xzf "${REMOTE_ARCHIVE}" -C "${REMOTE_SESSION_DIR}"
-rm -f "${REMOTE_ARCHIVE}"
-
+# Clean build
 if [[ "${ASCENDC_CLEAN_BUILD}" == "1" ]]; then
-  docker exec "${CONTAINER_NAME}" /bin/bash -lc '
-set -euo pipefail
-rm -rf "${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}"
-mkdir -p "${CONTAINER_WORKDIR}"
-'
-else
-  docker exec "${CONTAINER_NAME}" /bin/bash -lc 'mkdir -p "${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}"'
+  rm -rf "${BUILD_DIR}"
 fi
+mkdir -p "${BUILD_DIR}"
 
-docker cp "${REMOTE_SESSION_DIR}/." "${CONTAINER_NAME}:${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}"
+cd "${BUILD_DIR}"
+cmake "${KERNEL_DIR}" \
+  -DSOC_VERSION="${ASCENDC_SOC_VERSION}" \
+  -DASCEND_CANN_PACKAGE_PATH="${ASCEND_HOME_PATH}" \
+  -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
 
-docker exec "${CONTAINER_NAME}" /bin/bash -lc '
-set -euo pipefail
-cd "${CONTAINER_WORKDIR}"
-source set_env.sh
-cd "${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}"
-if [[ "${ASCENDC_CLEAN_BUILD}" == "1" ]]; then
-  PYTHONPATH="${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}/archive_tasks:${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}\${PYTHONPATH:+:\${PYTHONPATH}}" \
-  python utils/build_ascendc.py "${TASK}" -v "${ASCENDC_SOC_VERSION}" --clean
-else
-  PYTHONPATH="${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}/archive_tasks:${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}\${PYTHONPATH:+:\${PYTHONPATH}}" \
-  python utils/build_ascendc.py "${TASK}" -v "${ASCENDC_SOC_VERSION}"
-fi
-PYTHONPATH="${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}/archive_tasks:${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}\${PYTHONPATH:+:\${PYTHONPATH}}" \
-ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" \
-python utils/verification_ascendc.py "${TASK}"
-'
-EOF
+make -j$(nproc)
 
-echo "[3/4] Building and verifying AscendC inside container ${CONTAINER_NAME}"
-"${SSH_CMD[@]}" \
-  "${SSH_TARGET}" \
-  "${REMOTE_SCRIPT}"
+# WHL pack & install
+cd "${KERNEL_DIR}"
+python setup.py bdist_wheel
+pip install dist/*.whl --force-reinstall
 
-echo "[4/4] AscendC verification completed"
+cd "${WORKDIR}"
+
+PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
+  ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" \
+  python utils/verification_ascendc.py "${TASK_DIR}"

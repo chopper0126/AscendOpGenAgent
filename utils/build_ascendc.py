@@ -41,6 +41,16 @@ def _detect_ascend_path() -> Path:
 
 
 def _find_kernel_sources(kernel_dir: Path) -> list[Path]:
+    # 新结构: op_host/*.cpp + op_kernel/*.cpp
+    sources = []
+    for subdir in ("op_host", "op_kernel"):
+        sd = kernel_dir / subdir
+        if sd.is_dir():
+            sources.extend(sorted(sd.glob("*.cpp")))
+    if sources:
+        return sources
+
+    # 兼容旧结构: kernel/*.cpp (排除 pybind11.cpp)
     sources = sorted(
         path for path in kernel_dir.glob("*.cpp")
         if path.name != "pybind11.cpp"
@@ -48,6 +58,18 @@ def _find_kernel_sources(kernel_dir: Path) -> list[Path]:
     if not sources:
         raise FileNotFoundError(f"No kernel .cpp sources found in {kernel_dir}")
     return sources
+
+
+def _find_pybind_or_register(kernel_dir: Path) -> Path | None:
+    # 新结构: 使用 register.cpp
+    reg = kernel_dir / "register.cpp"
+    if reg.is_file():
+        return reg
+    # 旧结构: 使用 pybind11.cpp
+    pyb = kernel_dir / "pybind11.cpp"
+    if pyb.is_file():
+        return pyb
+    return None
 
 
 def _extract_pybind_module_name(pybind_path: Path) -> str:
@@ -69,6 +91,7 @@ def _generate_cmakelists(
     module_name: str,
     sources: list[Path],
     ascend_path: Path,
+    entry_path: Path,
 ) -> str:
     include_dirs = [kernel_dir]
     catlass_include = kernel_dir / "catlass" / "include"
@@ -116,7 +139,7 @@ ascendc_include_directories(kernels PRIVATE
     ${{ASCEND_CANN_PACKAGE_PATH}}/include/experiment/msprof
 )
 
-add_library(pybind11_lib SHARED "{kernel_dir / 'pybind11.cpp'}")
+add_library(pybind11_lib SHARED "{entry_path}")
 target_link_libraries(pybind11_lib PRIVATE
   kernels
   torch_npu
@@ -174,17 +197,49 @@ def _run(cmd: list[str], cwd: Path, env: dict[str, str]) -> None:
 def build(task: str, soc_version: str, build_type: str, clean: bool) -> Path:
     task_dir = _resolve_task_dir(task)
     kernel_dir = task_dir / "kernel"
-    pybind_path = kernel_dir / "pybind11.cpp"
     if not kernel_dir.is_dir():
         raise FileNotFoundError(f"Kernel directory not found: {kernel_dir}")
-    if not pybind_path.is_file():
-        raise FileNotFoundError(f"Missing pybind11 entry: {pybind_path}")
+
+    build_dir = kernel_dir / "build"
+    ascend_path = _detect_ascend_path()
+    env = os.environ.copy()
+    env["ASCEND_HOME_PATH"] = str(ascend_path)
+
+    # Mode A — 透传: kernel/CMakeLists.txt 已存在，直接用
+    native_cmake = kernel_dir / "CMakeLists.txt"
+    if native_cmake.is_file():
+        if clean and build_dir.exists():
+            shutil.rmtree(build_dir)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        cmake_configure = [
+            "cmake",
+            "-S",
+            str(kernel_dir),
+            "-B",
+            str(build_dir),
+            f"-DSOC_VERSION={soc_version}",
+            f"-DASCEND_CANN_PACKAGE_PATH={ascend_path}",
+            f"-DCMAKE_BUILD_TYPE={build_type}",
+        ]
+        cmake_build = ["cmake", "--build", str(build_dir), "-j"]
+        _run(cmake_configure, cwd=task_dir, env=env)
+        _run(cmake_build, cwd=task_dir, env=env)
+        return build_dir
+
+    # Mode B — 自动生成: 无 CMakeLists.txt，生成后编译
+    entry_path = _find_pybind_or_register(kernel_dir)
+    if entry_path is None:
+        raise FileNotFoundError(
+            f"No entry file (register.cpp or pybind11.cpp) found in {kernel_dir}"
+        )
 
     sources = _find_kernel_sources(kernel_dir)
-    module_name = _extract_pybind_module_name(pybind_path)
-    build_dir = kernel_dir / "build"
+    if entry_path.name == "register.cpp":
+        module_name = f"{task_dir.name}_ext"
+    else:
+        module_name = _extract_pybind_module_name(entry_path)
+
     cmake_dir = build_dir / "_autogen_cmake"
-    ascend_path = _detect_ascend_path()
 
     if clean and build_dir.exists():
         shutil.rmtree(build_dir)
@@ -198,12 +253,11 @@ def build(task: str, soc_version: str, build_type: str, clean: bool) -> Path:
             module_name=module_name,
             sources=sources,
             ascend_path=ascend_path,
+            entry_path=entry_path,
         ),
         encoding="utf-8",
     )
 
-    env = os.environ.copy()
-    env["ASCEND_HOME_PATH"] = str(ascend_path)
     cmake_configure = [
         "cmake",
         "-S",

@@ -10,7 +10,19 @@ argument-hint: >
 
 # TileLang Kernel 设计 Skill
 
-你是一名 TileLang kernel 设计与实现专家。你的目标是为 `{output_dir}/model.py` 中的 PyTorch Model 设计并实现自定义 TileLang kernel：完成 block-level 设计、tile-level 设计，并生成 `{output_dir}/model_new_tilelang.py` 调用自定义 TileLang kernel。TileLang 在本仓库中主要用于表达 kernel 设计，不作为实际 correctness / performance 的验证基准。
+你是一名 TileLang kernel 设计与实现专家。你的目标是为 `{output_dir}/model.py` 中的**复杂算子** PyTorch Model 设计并实现自定义 TileLang kernel：完成 block-level 设计、tile-level 设计，并生成 `{output_dir}/model_new_tilelang.py` 调用自定义 TileLang kernel。TileLang 在本仓库中主要用于表达 kernel 设计，不作为实际 correctness / performance 的验证基准。
+
+## 适用场景
+
+本 skill 仅用于**复杂算子**路径（见 CLAUDE.md 路由规则）：
+- Attention: FlashAttention, SparseAttention, GQA 等
+- MatMul 变体: 带 fuse 的 MatMul (matmul+leakyrelu, quant_matmul 等)
+- Norm 变体: RMSNorm, LayerNorm (多 strategy)
+- 复杂 Index: GatherElements, Scatter (非 trivial 寻址)
+- Sort: Sort, TopK
+- 多输入融合: Concat, multi-tensor fused ops
+
+**简单算子**（Elementwise, Pooling, 基础 Activation, 简单 Index）走 `design-doc-generator` → `ascendc-code-gen` 路径，不使用本 skill。
 
 ## 关键限制
 - 必须将核心计算融合成单个算子实现，不要拆分成多个独立算子。
